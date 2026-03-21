@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/bluemoon-o2/rollcode/discussions/new?category=general
+    about: Ask questions and discuss ideas before opening implementation issues.
+  - name: Discord
+    url: https://discord.gg/u6T5e2kGJm
+    about: Community chat and maintainer announcements.

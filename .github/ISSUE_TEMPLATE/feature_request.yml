@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose an improvement or new capability for RollCode.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the proposal. Concrete use cases help us prioritize and design quickly.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence describing the requested capability.
+      placeholder: Add a command to export memory checkpoints as markdown.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What pain exists today?
+      placeholder: I cannot audit agent learning without manually traversing memory git history.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe desired behavior, UX, command shape, or API.
+      placeholder: Add `rollcode memory export --agent <id>` and output structured markdown report.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What alternatives did you evaluate?
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who benefits, how often, and what outcome improves?
+      placeholder: Weekly use during release review; reduces manual triage time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References / prior art
+      description: Links to similar workflows, docs, or examples.

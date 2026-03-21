@@ -1,0 +1,78 @@
+import { useInput } from "ink";
+import { useEffect, useRef, useState } from "react";
+
+interface UseAutocompleteNavigationOptions<T> {
+  matches: T[];
+  onSelect?: (item: T) => void;
+  onAutocomplete?: (item: T) => void;
+  onActiveChange?: (isActive: boolean) => void;
+  manageActiveState?: boolean;
+  disabled?: boolean;
+}
+
+interface UseAutocompleteNavigationResult {
+  selectedIndex: number;
+}
+
+export function useAutocompleteNavigation<T>({
+  matches,
+  onSelect,
+  onAutocomplete,
+  onActiveChange,
+  manageActiveState = true,
+  disabled = false,
+}: UseAutocompleteNavigationOptions<T>): UseAutocompleteNavigationResult {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const prevMatchCountRef = useRef(0);
+  const prevIsActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (matches.length !== prevMatchCountRef.current) {
+      setSelectedIndex(0);
+      prevMatchCountRef.current = matches.length;
+    }
+  }, [matches.length]);
+
+  useEffect(() => {
+    if (manageActiveState) {
+      const isActive = matches.length > 0;
+      if (isActive !== prevIsActiveRef.current) {
+        prevIsActiveRef.current = isActive;
+        onActiveChange?.(isActive);
+      }
+    }
+  }, [matches.length, onActiveChange, manageActiveState]);
+
+  useInput((_input, key) => {
+    if (!matches.length || disabled) {
+      return;
+    }
+
+    // Keep navigation over the full result set. The renderer controls how many
+    // rows are visible and performs windowed scrolling.
+    const maxIndex = matches.length - 1;
+
+    if (key.upArrow) {
+      setSelectedIndex((prev) => (prev > 0 ? prev - 1 : maxIndex));
+      return;
+    }
+    if (key.downArrow) {
+      setSelectedIndex((prev) => (prev < maxIndex ? prev + 1 : 0));
+      return;
+    }
+    if (key.tab) {
+      const selected = matches[selectedIndex];
+      if (!selected) {
+        return;
+      }
+      if (onAutocomplete) {
+        onAutocomplete(selected);
+      } else if (onSelect) {
+        onSelect(selected);
+      }
+      return;
+    }
+  });
+
+  return { selectedIndex };
+}

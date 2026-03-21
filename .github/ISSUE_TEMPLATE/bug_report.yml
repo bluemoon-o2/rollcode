@@ -1,0 +1,84 @@
+name: Bug report
+description: Report crashes, regressions, or incorrect behavior in RollCode.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please keep this reproducible and evidence-based.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One sentence describing the issue.
+      placeholder: `rollcode run "..."` exits immediately when memory is initialized.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Shortest reliable repro path.
+      placeholder: |
+        1. Run `...`
+        2. Execute `rollcode ...`
+        3. Observe `...`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: RollCode should continue the run and show the session UI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: RollCode exits with an error and no session starts.
+    validations:
+      required: true
+
+  - type: input
+    id: rollcode_version
+    attributes:
+      label: RollCode version
+      description: Output of `rollcode --version`
+      placeholder: "0.0.2 (RollCode)"
+    validations:
+      required: true
+
+  - type: input
+    id: bun_version
+    attributes:
+      label: Bun version
+      description: Output of `bun --version`
+      placeholder: "1.3.11"
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 / Ubuntu 24.04 / Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Add redacted logs/screenshots/stack traces. Do not post secrets.
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Related issues, workaround attempts, or environment notes.
