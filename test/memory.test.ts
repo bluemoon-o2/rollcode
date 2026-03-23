@@ -25,6 +25,7 @@ describe("memory manager", () => {
     const before = await memory.status();
     expect(before).toContain("identity.md");
     expect(before).toContain("project-context.md");
+    expect(before).toContain("operator-profile.md");
 
     const summary = await memory.materializeDecision(
       {
@@ -94,6 +95,39 @@ describe("memory manager", () => {
 
     expect(recall).toContain("project/deploy-notes.md");
     expect(recall).toContain("[truncated by memory limit 48]");
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  test("captures and deduplicates operator preferences", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "rollcode-project-"));
+    const { MemoryManager } = await import("../src/memory/manager");
+    const memory = new MemoryManager("agent-memory-preference-test");
+    await memory.ensureInitialized(cwd);
+
+    const remembered = await memory.rememberOperatorPreference(
+      "优先给出可执行命令，不要只讲概念。",
+      "manual",
+    );
+    expect(remembered).toContain("Remembered operator preference");
+
+    const captured = await memory.captureOperatorPreferencesFromMessage(
+      "以后请优先给出最小改动方案。并且避免无关重构。",
+      "operator-message/run-1",
+    );
+    expect(captured).toContain("Captured operator preferences");
+
+    const duplicate = await memory.captureOperatorPreferencesFromMessage(
+      "以后请优先给出最小改动方案。",
+      "operator-message/run-2",
+    );
+    expect(duplicate).toBeNull();
+
+    const profile = await memory.operatorProfile();
+    expect(profile).toContain("Operator profile:");
+    expect(profile).toContain("优先给出最小改动方案");
+    expect(profile).toContain("source: operator-message/run-1");
+    expect(profile).toContain("避免无关重构");
 
     rmSync(cwd, { recursive: true, force: true });
   });

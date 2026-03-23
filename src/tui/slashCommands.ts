@@ -22,13 +22,13 @@ const FEEDBACK_ARGUMENT_HINT =
 const SESSION_COMMANDS: SlashCommandSpec[] = [
   {
     command: "/supervisor",
-    description: "Toggle supervisor details",
-    argumentMode: "none",
+    description: "Toggle details (/supervisor on|off|status)",
+    argumentMode: "optional",
   },
   {
     command: "/memory",
-    description: "Show memory status in stream",
-    argumentMode: "none",
+    description: "Memory status/profile/remember",
+    argumentMode: "optional",
   },
   {
     command: "/skills",

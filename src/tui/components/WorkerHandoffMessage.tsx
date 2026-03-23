@@ -1,7 +1,10 @@
 import { Box } from "ink";
 import { memo } from "react";
+import { TUI_ANIMATIONS_ENABLED } from "../animation";
+import { useAnimation } from "../contexts/AnimationContext";
 import type { WorkerHandoff } from "../../domain/types";
 import { colors } from "./colors";
+import { FlowingRoleLabel } from "./FlowingRoleLabel";
 import { expandToolsHint } from "./keybindingHints";
 import { MarkdownText } from "./MarkdownText";
 import { Text } from "./Text";
@@ -35,29 +38,48 @@ function compactSummary(summary: string): string {
 
 export const WorkerHandoffMessage = memo(
   ({ handoff, expanded }: { handoff: WorkerHandoff; expanded: boolean }) => {
+    const { shouldAnimate } = useAnimation();
+    const animate = TUI_ANIMATIONS_ENABLED && shouldAnimate;
     const summary = compactSummary(handoff.summary);
     const completionLabel = handoff.completionClaim ? "yes" : "no";
+    const completionColor = handoff.completionClaim
+      ? colors.customMessage.success
+      : colors.customMessage.warning;
 
     if (!expanded) {
       return (
-        <Box flexDirection="row" flexWrap="wrap">
-          <Text color={colors.customMessage.label}>[handoff]</Text>
-          <Text> </Text>
-          <Text color={colors.customMessage.text}>{summary}</Text>
-          <Text> </Text>
-          <Text
-            color={
-              handoff.completionClaim
-                ? colors.customMessage.success
-                : colors.customMessage.warning
-            }
-          >
-            completion: {completionLabel}
-          </Text>
-          <Text color={colors.customMessage.hint} dimColor>
-            {" "}
-            ({expandToolsHint("expand")})
-          </Text>
+        <Box flexDirection="column">
+          <Box flexDirection="row" flexWrap="wrap">
+            <Box width={2} flexShrink={0}>
+              <Text color={colors.customMessage.label}>▌</Text>
+            </Box>
+            <Text color={colors.event.hint} dimColor>
+              handoff
+            </Text>
+            <Text> </Text>
+            <Text color={colors.event.bracket}>[</Text>
+            <FlowingRoleLabel
+              text="worker"
+              staticColor={colors.customMessage.label}
+              palette={colors.event.roleFlow.worker}
+              animate={animate}
+            />
+            <Text color={colors.event.bracket}>]</Text>
+            <Text color={colors.event.hint} dimColor>
+              {" "}
+              ·{" "}
+            </Text>
+            <Text color={colors.customMessage.text}>{summary}</Text>
+            <Text color={colors.event.hint} dimColor>
+              {" "}
+              · completion:{" "}
+            </Text>
+            <Text color={completionColor}>{completionLabel}</Text>
+            <Text color={colors.customMessage.hint} dimColor>
+              {" "}
+              ({expandToolsHint("expand")})
+            </Text>
+          </Box>
         </Box>
       );
     }
@@ -65,15 +87,26 @@ export const WorkerHandoffMessage = memo(
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap">
-          <Text color={colors.customMessage.label}>[handoff]</Text>
+          <Box width={2} flexShrink={0}>
+            <Text color={colors.customMessage.label}>▌</Text>
+          </Box>
+          <Text color={colors.event.hint} dimColor>
+            handoff
+          </Text>
           <Text> </Text>
-          <Text
-            color={
-              handoff.completionClaim
-                ? colors.customMessage.success
-                : colors.customMessage.warning
-            }
-          >
+          <Text color={colors.event.bracket}>[</Text>
+          <FlowingRoleLabel
+            text="worker"
+            staticColor={colors.customMessage.label}
+            palette={colors.event.roleFlow.worker}
+            animate={animate}
+          />
+          <Text color={colors.event.bracket}>]</Text>
+          <Text color={colors.event.hint} dimColor>
+            {" "}
+            ·{" "}
+          </Text>
+          <Text color={completionColor}>
             completion claim: {completionLabel}
           </Text>
           <Text color={colors.customMessage.hint} dimColor>
@@ -81,10 +114,19 @@ export const WorkerHandoffMessage = memo(
             ({expandToolsHint("collapse")})
           </Text>
         </Box>
-        <MarkdownText
-          text={formatExpandedBody(handoff)}
-          baseColor={colors.customMessage.text}
-        />
+        <Box flexDirection="row">
+          <Box width={2} flexShrink={0}>
+            <Text color={colors.customMessage.label} dimColor>
+              ▏
+            </Text>
+          </Box>
+          <Box flexGrow={1}>
+            <MarkdownText
+              text={formatExpandedBody(handoff)}
+              baseColor={colors.customMessage.text}
+            />
+          </Box>
+        </Box>
       </Box>
     );
   },

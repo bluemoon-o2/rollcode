@@ -38,37 +38,64 @@ export const UserMessage = memo(
       maxPreviewChars,
       maxPreviewLines,
     );
+    const title = prompt || (line.id.startsWith("goal-") ? "goal" : "user");
 
     return (
       <Box flexDirection="column">
-        {prompt ? <Text color={colors.userMessage.label}>{prompt}</Text> : null}
-        {collapsed ? (
-          <CollapsedOutputDisplay
-            output={normalized}
-            maxLines={maxPreviewLines}
-            maxChars={maxPreviewChars}
-            hintText={expandToolsHint("expand")}
-          />
-        ) : (
-          <>
-            {lines.map((entry, index) => (
-              <Text
-                key={`${line.id}-${index}`}
-                color={colors.userMessage.text}
-                backgroundColor={colors.userMessage.background}
-              >
-                {" "}
-                {entry || " "}
-                {" "}
+        <Box flexDirection="row" flexWrap="wrap">
+          <Box width={2} flexShrink={0}>
+            <Text color={colors.userMessage.label}>▌</Text>
+          </Box>
+          <Text color={colors.event.hint} dimColor>
+            message
+          </Text>
+          <Text> </Text>
+          <Text color={colors.event.bracket}>[</Text>
+          <Text color={colors.userMessage.label}>{title}</Text>
+          <Text color={colors.event.bracket}>]</Text>
+        </Box>
+        <Box flexDirection="row">
+          <Box width={2} flexShrink={0}>
+            <Text color={colors.userMessage.label} dimColor>
+              ▏
+            </Text>
+          </Box>
+          <Box flexGrow={1}>
+            {collapsed ? (
+              <CollapsedOutputDisplay
+                output={normalized}
+                maxLines={maxPreviewLines}
+                maxChars={maxPreviewChars}
+                hintText={expandToolsHint("expand")}
+                firstLinePrefix=""
+                restLinePrefix=""
+              />
+            ) : (
+              <Box flexDirection="column">
+                {lines.map((entry, index) => (
+                  <Text
+                    key={`${line.id}-${index}`}
+                    color={colors.userMessage.text}
+                  >
+                    {entry || " "}
+                  </Text>
+                ))}
+              </Box>
+            )}
+          </Box>
+        </Box>
+        {expanded && canCollapse ? (
+          <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              <Text color={colors.userMessage.label} dimColor>
+                ▏
               </Text>
-            ))}
-            {expanded && canCollapse ? (
-              <Text color={colors.customMessage.hint} dimColor>
-                ({expandToolsHint("collapse")})
-              </Text>
-            ) : null}
-          </>
-        )}
+            </Box>
+            <Text color={colors.customMessage.hint} dimColor>
+              ({expandToolsHint("collapse")})
+            </Text>
+          </Box>
+        ) : null}
       </Box>
     );
   },

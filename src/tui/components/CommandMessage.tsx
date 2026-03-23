@@ -4,8 +4,10 @@ import { TUI_ANIMATIONS_ENABLED } from "../animation";
 import { useAnimation } from "../contexts/AnimationContext";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { colors } from "./colors";
-import { expandToolsHint } from "./keybindingHints";
+import { FlowingRoleLabel } from "./FlowingRoleLabel";
+import { expandToolsHint, formatKeyHint } from "./keybindingHints";
 import { Text } from "./Text";
+import { useAnimationTick } from "./useAnimationTick";
 
 type CommandLine = {
   kind: "command";
@@ -116,42 +118,90 @@ export const CommandMessage = memo(
         : line.success === false
           ? colors.command.error
           : colors.command.success;
+    const statusLabel =
+      line.phase === "running"
+        ? "running"
+        : line.success === false || line.exitCode === null
+          ? "failed"
+          : "completed";
+    const frameTick = useAnimationTick(line.phase === "running");
+    const railFrames = ["▏", "▎", "▍", "▎"] as const;
+    const railSymbol =
+      line.phase === "running"
+        ? railFrames[frameTick % railFrames.length] ?? "▎"
+        : "▏";
 
     if (variant === "timeline") {
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" flexWrap="wrap">
-            <Text color={statusColor}>{statusGlyph}</Text>
-            <Text> </Text>
-            <Text color={colors.event.hint}>command</Text>
-            <Text> </Text>
-            <Text color={colors.event.worker} bold>
-              {line.input}
+            <Box width={2} flexShrink={0}>
+              <Text color={statusColor}>
+                {line.phase === "running" && animateSpinner ? spinner : "▌"}
+              </Text>
+            </Box>
+            <Text color={colors.event.hint} dimColor>
+              tool
             </Text>
+            <Text> </Text>
+            <Text color={colors.event.bracket}>[</Text>
+            <FlowingRoleLabel
+              text="command"
+              staticColor={colors.event.worker}
+              palette={colors.event.roleFlow.worker}
+              animate={line.phase === "running"}
+            />
+            <Text color={colors.event.bracket}>]</Text>
+            <Text color={colors.event.hint} dimColor>
+              {" "}
+              ·{" "}
+            </Text>
+            <Text color={statusColor}>{statusLabel}</Text>
+            {line.phase === "running" ? (
+              <Text color={colors.event.hint} dimColor>
+                {" "}
+                ({formatKeyHint("esc", "to cancel")})
+              </Text>
+            ) : null}
+          </Box>
+
+          <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              <Text color={statusColor} dimColor>
+                {railSymbol}
+              </Text>
+            </Box>
+            <Box flexGrow={1}>
+              <Text color={colors.event.worker} bold>
+                {line.input}
+              </Text>
+            </Box>
           </Box>
 
           {hasOutput ? (
-            <Box marginLeft={2} flexDirection="column">
-              {previewLines.map((entry, index) => (
-                <Text key={`${line.id}-out-${index}-${entry}`} color={outputColor}>
-                  {entry}
+            <Box flexDirection="row">
+              <Box width={2} flexShrink={0}>
+                <Text color={statusColor} dimColor>
+                  {railSymbol}
                 </Text>
-              ))}
-            </Box>
-          ) : null}
-
-          {line.phase === "running" ? (
-            <Box marginLeft={2}>
-              <Text color={colors.command.running}>
-                {animateSpinner
-                  ? `${spinner} Running... (Esc to cancel)`
-                  : "Running... (Esc to cancel)"}
-              </Text>
+              </Box>
+              <Box flexGrow={1} flexDirection="column">
+                {previewLines.map((entry, index) => (
+                  <Text key={`${line.id}-out-${index}-${entry}`} color={outputColor}>
+                    {entry}
+                  </Text>
+                ))}
+              </Box>
             </Box>
           ) : null}
 
           {line.phase !== "running" && hasCollapsedOutput && !expanded ? (
-            <Box marginLeft={2}>
+            <Box flexDirection="row">
+              <Box width={2} flexShrink={0}>
+                <Text color={statusColor} dimColor>
+                  {railSymbol}
+                </Text>
+              </Box>
               <Text color={colors.event.hint} dimColor>
                 ... {hiddenLineCount} more lines ({expandToolsHint("expand")})
               </Text>
@@ -159,7 +209,12 @@ export const CommandMessage = memo(
           ) : null}
 
           {line.phase !== "running" && hasCollapsedOutput && expanded ? (
-            <Box marginLeft={2}>
+            <Box flexDirection="row">
+              <Box width={2} flexShrink={0}>
+                <Text color={statusColor} dimColor>
+                  {railSymbol}
+                </Text>
+              </Box>
               <Text color={colors.event.hint} dimColor>
                 ({expandToolsHint("collapse")})
               </Text>
@@ -168,9 +223,14 @@ export const CommandMessage = memo(
 
           {line.phase !== "running" &&
           (line.success === false || line.exitCode === null) ? (
-            <Box marginLeft={2}>
+            <Box flexDirection="row">
+              <Box width={2} flexShrink={0}>
+                <Text color={statusColor} dimColor>
+                  {railSymbol}
+                </Text>
+              </Box>
               <Text color={colors.command.error}>
-                {formatExitStatus(line.exitCode)}
+                {statusGlyph} {formatExitStatus(line.exitCode)}
               </Text>
             </Box>
           ) : null}

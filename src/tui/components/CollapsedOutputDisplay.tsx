@@ -4,7 +4,8 @@ import { colors } from "./colors";
 import { Text } from "./Text";
 
 const DEFAULT_COLLAPSED_LINES = 3;
-const PREFIX_WIDTH = 5; // "  ⎿  " or "     "
+const DEFAULT_FIRST_PREFIX = "  ⎿  ";
+const DEFAULT_REST_PREFIX = "     ";
 
 function splitOutputLines(output: string): string[] {
   const lines = output.split("\n");
@@ -49,6 +50,8 @@ interface CollapsedOutputDisplayProps {
   maxLines?: number; // Infinity = show all lines
   maxChars?: number;
   hintText?: string;
+  firstLinePrefix?: string;
+  restLinePrefix?: string;
 }
 
 export const CollapsedOutputDisplay = memo(
@@ -57,6 +60,8 @@ export const CollapsedOutputDisplay = memo(
     maxLines = DEFAULT_COLLAPSED_LINES,
     maxChars,
     hintText,
+    firstLinePrefix = DEFAULT_FIRST_PREFIX,
+    restLinePrefix = DEFAULT_REST_PREFIX,
   }: CollapsedOutputDisplayProps) => {
     const clipped = clipOutputByChars(output, maxChars);
     const lines = splitOutputLines(clipped.displayOutput);
@@ -68,22 +73,27 @@ export const CollapsedOutputDisplay = memo(
     const visibleLines = showAll ? lines : lines.slice(0, maxLines);
     const hiddenCount = showAll ? 0 : Math.max(0, lines.length - maxLines);
     const hintSuffix = hintText ? `, ${hintText}` : "";
+    const prefixWidth = Math.max(firstLinePrefix.length, restLinePrefix.length);
 
     return (
       <Box flexDirection="column">
         <Box flexDirection="row">
-          <Box width={PREFIX_WIDTH} flexShrink={0}>
-            <Text>{"  ⎿  "}</Text>
-          </Box>
+          {prefixWidth > 0 ? (
+            <Box width={prefixWidth} flexShrink={0}>
+              <Text>{firstLinePrefix}</Text>
+            </Box>
+          ) : null}
           <Box flexGrow={1}>
             <Text color={colors.event.body}>{visibleLines[0] ?? ""}</Text>
           </Box>
         </Box>
         {visibleLines.slice(1).map((line, index) => (
           <Box key={`${index}-${line}`} flexDirection="row">
-            <Box width={PREFIX_WIDTH} flexShrink={0}>
-              <Text>{"     "}</Text>
-            </Box>
+            {prefixWidth > 0 ? (
+              <Box width={prefixWidth} flexShrink={0}>
+                <Text>{restLinePrefix}</Text>
+              </Box>
+            ) : null}
             <Box flexGrow={1}>
               <Text color={colors.event.body}>{line}</Text>
             </Box>
@@ -91,9 +101,11 @@ export const CollapsedOutputDisplay = memo(
         ))}
         {hiddenCount > 0 ? (
           <Box flexDirection="row">
-            <Box width={PREFIX_WIDTH} flexShrink={0}>
-              <Text>{"     "}</Text>
-            </Box>
+            {prefixWidth > 0 ? (
+              <Box width={prefixWidth} flexShrink={0}>
+                <Text>{restLinePrefix}</Text>
+              </Box>
+            ) : null}
             <Box flexGrow={1}>
               <Text color={colors.event.hint} dimColor>
                 ... ({hiddenCount} more lines{hintSuffix})
@@ -102,9 +114,11 @@ export const CollapsedOutputDisplay = memo(
           </Box>
         ) : clipped.clippedByChars ? (
           <Box flexDirection="row">
-            <Box width={PREFIX_WIDTH} flexShrink={0}>
-              <Text>{"     "}</Text>
-            </Box>
+            {prefixWidth > 0 ? (
+              <Box width={prefixWidth} flexShrink={0}>
+                <Text>{restLinePrefix}</Text>
+              </Box>
+            ) : null}
             <Box flexGrow={1}>
               <Text color={colors.event.hint} dimColor>
                 ... (output clipped{hintSuffix})

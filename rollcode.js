@@ -19145,6 +19145,10 @@ ${document2.body.replace(/^\n+/, "")}`;
 var DEFAULT_LIMIT = 4000;
 var DEFAULT_RECALL_RESULTS = 4;
 var RECALL_SNIPPET_SOFT_LIMIT = 720;
+var DEFAULT_OPERATOR_PROFILE_LIMIT = 2400;
+var OPERATOR_PROFILE_RELATIVE_PATH = "system/operator-profile.md";
+var LEARNED_PREFERENCES_HEADING = "## Learned Preferences";
+var OPERATOR_PREFERENCE_HINT_PATTERN = /(?:\b(?:always|never|prefer|preference|default|avoid|must|should|instead|keep|use|without)\b|\u8BF7|\u4E0D\u8981|\u522B|\u4F18\u5148|\u504F\u597D|\u4E60\u60EF|\u9ED8\u8BA4|\u8BB0\u4F4F|\u4EE5\u540E|\u957F\u671F|\u5FC5\u987B|\u52A1\u5FC5|\u5C3D\u91CF|\u907F\u514D)/i;
 var RECALL_STOP_WORDS = new Set([
   "the",
   "and",
@@ -19357,6 +19361,92 @@ function applyMemoryLimit(text, limit) {
   return `${normalized.slice(0, safeLimit)}
 ...[truncated by memory limit ${safeLimit}]`;
 }
+function normalizePreferenceText(input) {
+  return input.replace(/\s+/g, " ").replace(/^[\-*#\d.():\uFF1A\s]+/, "").replace(/[\u3002\uFF1B;\uFF0C,\s]+$/g, "").trim();
+}
+function canonicalizePreference(input) {
+  return normalizePreferenceText(input.replace(/^\[[^\]]+\]\s*/, "").replace(/\(source:[^)]+\)\s*$/i, "")).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function extractOperatorPreferenceCandidates(message) {
+  if (!message.trim()) {
+    return [];
+  }
+  const candidates = message.split(/[\r\n]+|[\u3002\uFF01\uFF1F!?\uFF1B;]+/g).map((segment) => normalizePreferenceText(segment)).filter((segment) => segment.length >= 8 && segment.length <= 220).filter((segment) => OPERATOR_PREFERENCE_HINT_PATTERN.test(segment));
+  const seen = new Set;
+  const selected = [];
+  for (const candidate of candidates) {
+    const canonical = canonicalizePreference(candidate);
+    if (!canonical || seen.has(canonical)) {
+      continue;
+    }
+    seen.add(canonical);
+    selected.push(candidate);
+    if (selected.length >= 4) {
+      break;
+    }
+  }
+  return selected;
+}
+function collectExistingPreferenceKeys(body) {
+  const keys = new Set;
+  for (const line of body.split(/\r?\n/)) {
+    const match = /^\s*-\s+(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const key = canonicalizePreference(match[1] ?? "");
+    if (key) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+function injectLearnedPreferences(body, bullets) {
+  const normalized = body.trimEnd();
+  if (!normalized) {
+    return `${LEARNED_PREFERENCES_HEADING}
+
+${bullets.join(`
+`)}
+`;
+  }
+  const lines = normalized.split(`
+`);
+  const headingIndex = lines.findIndex((line) => line.trim() === LEARNED_PREFERENCES_HEADING);
+  if (headingIndex === -1) {
+    return `${normalized}
+
+${LEARNED_PREFERENCES_HEADING}
+
+${bullets.join(`
+`)}
+`;
+  }
+  let sectionEnd = lines.length;
+  for (let index = headingIndex + 1;index < lines.length; index += 1) {
+    if (lines[index]?.startsWith("## ")) {
+      sectionEnd = index;
+      break;
+    }
+  }
+  const before = lines.slice(0, headingIndex + 1).join(`
+`);
+  const after = lines.slice(sectionEnd).join(`
+`);
+  const existingSection = lines.slice(headingIndex + 1, sectionEnd).filter((line) => line.trim() !== "- (none yet)").join(`
+`).trim();
+  const mergedSection = existingSection ? `${bullets.join(`
+`)}
+${existingSection}` : bullets.join(`
+`);
+  const afterBlock = after.trim() ? `
+
+${after.trimStart()}` : "";
+  return `${before}
+
+${mergedSection}${afterBlock}
+`;
+}
 
 class MemoryManager {
   agentId;
@@ -19389,6 +19479,19 @@ class MemoryManager {
 - Repository root: ${cwd}
 - RollCode project root: ${getProjectRoot()}
 - Update this file only with durable conventions, architecture, or user preferences.
+      `.trim());
+    await this.ensureFile(join3(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH), {
+      description: "Pinned operator preferences and collaboration style (Letta-style human profile).",
+      limit: DEFAULT_OPERATOR_PROFILE_LIMIT
+    }, `
+# Operator Profile
+
+- Keep this file focused on durable operator preferences, not one-off task chatter.
+- Prefer concise bullets that can guide behavior in future runs.
+
+## Learned Preferences
+
+- (none yet)
       `.trim());
     if (!await pathExists(join3(this.memoryDir, ".git"))) {
       this.runGit(["init"]);
@@ -19525,11 +19628,90 @@ ${section}
     ].join(`
 `);
   }
+  async operatorProfile() {
+    const profilePath = join3(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH);
+    if (!await pathExists(profilePath)) {
+      return "Operator profile is not initialized yet.";
+    }
+    const profile = parseFrontmatter(await readFile2(profilePath, "utf8"));
+    return [
+      `Operator profile: ${profilePath}`,
+      "",
+      applyMemoryLimit(profile.body, profile.attributes.limit)
+    ].join(`
+`);
+  }
+  async rememberOperatorPreference(preference, source = "manual") {
+    const normalized = normalizePreferenceText(preference);
+    if (!normalized) {
+      return null;
+    }
+    const added = await this.appendOperatorPreferences([normalized], source);
+    if (added.length === 0) {
+      return null;
+    }
+    return `Remembered operator preference: ${added.join(" | ")}`;
+  }
+  async captureOperatorPreferencesFromMessage(message, source = "operator-message") {
+    const candidates = extractOperatorPreferenceCandidates(message);
+    if (candidates.length === 0) {
+      return null;
+    }
+    const added = await this.appendOperatorPreferences(candidates, source);
+    if (added.length === 0) {
+      return null;
+    }
+    return `Captured operator preferences: ${added.join(" | ")}`;
+  }
   diff() {
     return this.runGit(["diff", "--no-ext-diff"], true);
   }
   log() {
     return this.runGit(["log", "--oneline", "-n", "20"], true);
+  }
+  async appendOperatorPreferences(preferences, source) {
+    if (preferences.length === 0) {
+      return [];
+    }
+    const profilePath = join3(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH);
+    if (!await pathExists(profilePath)) {
+      return [];
+    }
+    const existing = parseFrontmatter(await readFile2(profilePath, "utf8"));
+    const existingKeys = collectExistingPreferenceKeys(existing.body);
+    const added = [];
+    for (const preference of preferences) {
+      const normalized = normalizePreferenceText(preference);
+      if (!normalized) {
+        continue;
+      }
+      const key = canonicalizePreference(normalized);
+      if (!key || existingKeys.has(key)) {
+        continue;
+      }
+      existingKeys.add(key);
+      added.push(normalized);
+    }
+    if (added.length === 0) {
+      return [];
+    }
+    const stamp = todayStamp();
+    const sourceLabel = normalizePreferenceText(source) || "manual";
+    const bullets = added.map((item) => `- [${stamp}] ${item} (source: ${sourceLabel})`);
+    const nextBody = injectLearnedPreferences(existing.body, bullets);
+    await writeText(profilePath, stringifyFrontmatter({
+      attributes: {
+        ...existing.attributes,
+        updatedAt: nowIso()
+      },
+      body: nextBody
+    }));
+    this.runGit(["add", OPERATOR_PROFILE_RELATIVE_PATH]);
+    const status = this.runGit(["status", "--porcelain"], true).trim();
+    if (status) {
+      this.runGit(["commit", "-m", "memory: update operator profile"], true);
+    }
+    return added;
   }
   async ensureFile(path, attributes, body) {
     if (await pathExists(path)) {
@@ -23781,6 +23963,8 @@ function selectParallelLanePlan(args) {
 
 // src/runtime/service.ts
 var INTERRUPTED_GUIDANCE_MESSAGE = "Interrupted \u2013 tell the agent what to do differently. Something went wrong? Use /feedback to report issues.";
+var SUPERVISOR_COMMAND_USAGE = "Usage: /supervisor [on|off|status]";
+var MEMORY_COMMAND_USAGE = "Usage: /memory [status|profile|remember <preference>]";
 function isTransientHttpError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /(?:\b502\b|\b503\b|\b504\b|\b521\b|\b522\b|\b524\b|bad gateway|gateway timeout|temporar(?:y|ily) unavailable|upstream timeout|econnreset|etimedout)/i.test(message);
@@ -23797,6 +23981,76 @@ function normalizeSupervisorDecision(decision) {
     ...decision,
     nextInstruction: typeof decision.nextInstruction === "string" ? decision.nextInstruction : ""
   };
+}
+function parseSupervisorVisibilityCommand(input) {
+  const trimmed = input.trim();
+  if (trimmed === "/supervisor") {
+    return "toggle";
+  }
+  const match = /^\/supervisor(?:\s+([a-zA-Z]+))$/.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const mode = (match[1] ?? "").toLowerCase();
+  if (mode === "on" || mode === "off" || mode === "status") {
+    return mode;
+  }
+  return null;
+}
+function applySupervisorVisibilityCommand(current, command) {
+  if (command === "status") {
+    return current;
+  }
+  if (command === "on") {
+    return true;
+  }
+  if (command === "off") {
+    return false;
+  }
+  return !current;
+}
+function formatSupervisorVisibilityMessage(visible, hasHistory, command) {
+  if (command === "status") {
+    return visible ? "Supervisor details are ON." : "Supervisor details are OFF.";
+  }
+  if (visible) {
+    return hasHistory ? "Supervisor details enabled." : "Supervisor details enabled (no supervisor decisions recorded yet).";
+  }
+  return "Supervisor details hidden.";
+}
+function parseSessionMemoryCommand(input) {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/memory")) {
+    return null;
+  }
+  const head = trimmed.split(/\s+/)[0];
+  if (head !== "/memory") {
+    return null;
+  }
+  if (trimmed === "/memory") {
+    return { kind: "status" };
+  }
+  if (/^\/memory\s+status$/i.test(trimmed)) {
+    return { kind: "status" };
+  }
+  if (/^\/memory\s+profile$/i.test(trimmed)) {
+    return { kind: "profile" };
+  }
+  const rememberMatch = /^\/memory\s+remember\s+([\s\S]+)$/i.exec(trimmed);
+  if (rememberMatch) {
+    const preference = (rememberMatch[1] ?? "").trim();
+    if (!preference) {
+      return { kind: "invalid", hint: MEMORY_COMMAND_USAGE };
+    }
+    return { kind: "remember", preference };
+  }
+  if (/^\/memory\s+remember$/i.test(trimmed)) {
+    return {
+      kind: "invalid",
+      hint: "Usage: /memory remember <preference>"
+    };
+  }
+  return { kind: "invalid", hint: MEMORY_COMMAND_USAGE };
 }
 function isPidAlive4(pid) {
   if (!pid) {
@@ -23919,6 +24173,62 @@ class DetachedRunWatcher {
       });
       return;
     }
+    const supervisorCommand = parseSupervisorVisibilityCommand(trimmed);
+    if (supervisorCommand) {
+      const nextVisible = applySupervisorVisibilityCommand(this.snapshot.showSupervisor, supervisorCommand);
+      const hasHistory = Boolean(this.snapshot.latestSupervisorDecision) || this.snapshot.turnHistory.some((entry) => entry.threadRole === "supervisor");
+      this.publishSnapshot({
+        ...this.snapshot,
+        showSupervisor: nextVisible,
+        logs: [
+          ...this.snapshot.logs,
+          formatSupervisorVisibilityMessage(nextVisible, hasHistory, supervisorCommand)
+        ]
+      });
+      return;
+    }
+    if (trimmed.startsWith("/supervisor")) {
+      this.publishSnapshot({
+        ...this.snapshot,
+        logs: [...this.snapshot.logs, SUPERVISOR_COMMAND_USAGE]
+      });
+      return;
+    }
+    const memoryCommand = parseSessionMemoryCommand(trimmed);
+    if (memoryCommand) {
+      const memory = new MemoryManager(this.agent.id);
+      if (memoryCommand.kind === "status") {
+        const status = await memory.status();
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [...this.snapshot.logs, status]
+        });
+        return;
+      }
+      if (memoryCommand.kind === "profile") {
+        const profile = await memory.operatorProfile();
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [...this.snapshot.logs, profile]
+        });
+        return;
+      }
+      if (memoryCommand.kind === "remember") {
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [
+            ...this.snapshot.logs,
+            "Attach mode is read-only. Use owner session for /memory remember."
+          ]
+        });
+        return;
+      }
+      this.publishSnapshot({
+        ...this.snapshot,
+        logs: [...this.snapshot.logs, memoryCommand.hint]
+      });
+      return;
+    }
     switch (trimmed) {
       case "/new":
         this.publishSnapshot({
@@ -23929,21 +24239,6 @@ class DetachedRunWatcher {
           ]
         });
         return;
-      case "/supervisor":
-        this.publishSnapshot({
-          ...this.snapshot,
-          showSupervisor: !this.snapshot.showSupervisor
-        });
-        return;
-      case "/memory": {
-        const memory = new MemoryManager(this.agent.id);
-        const status = await memory.status();
-        this.publishSnapshot({
-          ...this.snapshot,
-          logs: [...this.snapshot.logs, status]
-        });
-        return;
-      }
       case "/skills": {
         const discovery = await discoverSkillsDetailed(this.agent.cwd, this.agent.id);
         this.publishSnapshot({
@@ -24176,13 +24471,38 @@ class RunRuntime {
       this.pushLog(feedback.message);
       return;
     }
+    const supervisorCommand = parseSupervisorVisibilityCommand(trimmed);
+    if (supervisorCommand) {
+      this.showSupervisor = applySupervisorVisibilityCommand(this.showSupervisor, supervisorCommand);
+      const hasHistory = Boolean(this.latestSupervisorDecision) || this.service.store.listTurnOutputs(this.run.id).some((entry) => entry.threadRole === "supervisor");
+      this.pushLog(formatSupervisorVisibilityMessage(this.showSupervisor, hasHistory, supervisorCommand));
+      return;
+    }
+    if (trimmed.startsWith("/supervisor")) {
+      this.pushLog(SUPERVISOR_COMMAND_USAGE);
+      return;
+    }
+    const memoryCommand = parseSessionMemoryCommand(trimmed);
+    if (memoryCommand) {
+      if (memoryCommand.kind === "status") {
+        this.pushLog(await this.memory.status());
+        return;
+      }
+      if (memoryCommand.kind === "profile") {
+        this.pushLog(await this.memory.operatorProfile());
+        return;
+      }
+      if (memoryCommand.kind === "remember") {
+        const summary = await this.memory.rememberOperatorPreference(memoryCommand.preference, "manual");
+        this.pushLog(summary || "No new operator preference captured (empty or duplicate).");
+        return;
+      }
+      this.pushLog(memoryCommand.hint);
+      return;
+    }
     switch (trimmed) {
       case "/new":
         this.pushLog("Use /exit to leave this run, then use /new in launcher.");
-        return;
-      case "/supervisor":
-        this.showSupervisor = !this.showSupervisor;
-        this.publish();
         return;
       case "/resume":
         this.pushLog("Resuming current run. To open run history picker, exit to launcher and use /resume there (or run `rollcode resume`).");
@@ -24194,9 +24514,6 @@ class RunRuntime {
           this.publish();
         }
         await this.resumeAutonomy();
-        return;
-      case "/memory":
-        this.pushLog(await this.memory.status());
         return;
       case "/skills":
       case "/skills reload":
@@ -25217,6 +25534,18 @@ ${helper.commandOutput.trim()}` : "").filter((output) => output.length > 0)
     this.publish();
   }
   async sendOperatorMessage(message) {
+    try {
+      const captured = await this.memory.captureOperatorPreferencesFromMessage(message, `operator-message/${this.run.id}`);
+      if (captured) {
+        await this.record("system", "memory-preference", {
+          message: captured
+        });
+      }
+    } catch (error) {
+      await this.record("system", "memory-error", {
+        message: error instanceof Error ? `Operator preference capture failed: ${error.message}` : `Operator preference capture failed: ${String(error)}`
+      });
+    }
     const activeTurnId = this.activeTurnIds.worker;
     if (activeTurnId && this.agent.workerThreadId) {
       await this.service.codex.steerTurn(this.agent.workerThreadId, activeTurnId, `Operator message:
@@ -33387,13 +33716,13 @@ var FEEDBACK_ARGUMENT_HINT = "\u8BF7\u8F93\u5165\u53CD\u9988\u5185\u5BB9\u540E\u
 var SESSION_COMMANDS = [
   {
     command: "/supervisor",
-    description: "Toggle supervisor details",
-    argumentMode: "none"
+    description: "Toggle details (/supervisor on|off|status)",
+    argumentMode: "optional"
   },
   {
     command: "/memory",
-    description: "Show memory status in stream",
-    argumentMode: "none"
+    description: "Memory status/profile/remember",
+    argumentMode: "optional"
   },
   {
     command: "/skills",
@@ -34034,13 +34363,76 @@ function formatKeyForDisplay(key) {
   if (!isMac) {
     return key;
   }
-  return key.replace(/\balt\+/gi, "\u2325");
+  const segments = key.split("+").map((segment) => segment.trim()).filter(Boolean).map((segment) => {
+    const lower = segment.toLowerCase();
+    switch (lower) {
+      case "ctrl":
+      case "control":
+        return "\u2303";
+      case "alt":
+      case "option":
+        return "\u2325";
+      case "shift":
+        return "\u21E7";
+      case "cmd":
+      case "command":
+      case "meta":
+        return "\u2318";
+      case "enter":
+      case "return":
+        return "\u21B5";
+      case "esc":
+      case "escape":
+        return "\u238B";
+      case "tab":
+        return "\u21E5";
+      case "up":
+        return "\u2191";
+      case "down":
+        return "\u2193";
+      case "left":
+        return "\u2190";
+      case "right":
+        return "\u2192";
+      case "space":
+        return "\u2420";
+      default:
+        return lower;
+    }
+  });
+  if (segments.length === 0) {
+    return key;
+  }
+  const symbols = new Set([
+    "\u2303",
+    "\u2325",
+    "\u21E7",
+    "\u2318",
+    "\u21B5",
+    "\u238B",
+    "\u21E5",
+    "\u2191",
+    "\u2193",
+    "\u2190",
+    "\u2192",
+    "\u2420"
+  ]);
+  const onlySymbols = segments.every((segment) => symbols.has(segment));
+  if (onlySymbols) {
+    return segments.join("");
+  }
+  const modifiers = segments.filter((segment) => ["\u2303", "\u2325", "\u21E7", "\u2318"].includes(segment));
+  const keys2 = segments.filter((segment) => !modifiers.includes(segment));
+  if (keys2.length === 0) {
+    return modifiers.join("");
+  }
+  return `${modifiers.join("")}${keys2.join("+")}`;
 }
-function keyHint(key, description) {
+function formatKeyHint(key, description) {
   return `${formatKeyForDisplay(key)} ${description}`;
 }
 function expandToolsHint(action) {
-  return keyHint(EXPAND_TOOLS_KEY, `to ${action}`);
+  return formatKeyHint(EXPAND_TOOLS_KEY, `to ${action}`);
 }
 
 // src/tui/helpContent.ts
@@ -34524,16 +34916,43 @@ async function runRollcodeLauncher(options) {
 }
 
 // src/tui/App.tsx
-var import_react41 = __toESM(require_react(), 1);
+var import_react42 = __toESM(require_react(), 1);
 
 // src/tui/components/AssistantMessage.tsx
-var import_react33 = __toESM(require_react(), 1);
+var import_react36 = __toESM(require_react(), 1);
 
-// src/tui/components/CollapsedOutputDisplay.tsx
+// src/tui/components/BlinkDot.tsx
 var import_react32 = __toESM(require_react(), 1);
 var jsx_dev_runtime12 = __toESM(require_jsx_dev_runtime(), 1);
+var BlinkDot = import_react32.memo(({
+  color = colors.tool.pending,
+  symbol = "\u25CF",
+  shouldAnimate = true
+}) => {
+  const { shouldAnimate: shouldAnimateContext } = useAnimation();
+  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimateContext && shouldAnimate !== false;
+  const [on, setOn] = import_react32.useState(true);
+  import_react32.useEffect(() => {
+    if (!animate) {
+      setOn(true);
+      return;
+    }
+    const timer = setInterval(() => setOn((value) => !value), 400);
+    return () => clearInterval(timer);
+  }, [animate]);
+  return /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
+    color,
+    children: on || !animate ? symbol : " "
+  }, undefined, false, undefined, this);
+});
+BlinkDot.displayName = "BlinkDot";
+
+// src/tui/components/CollapsedOutputDisplay.tsx
+var import_react33 = __toESM(require_react(), 1);
+var jsx_dev_runtime13 = __toESM(require_jsx_dev_runtime(), 1);
 var DEFAULT_COLLAPSED_LINES = 3;
-var PREFIX_WIDTH = 5;
+var DEFAULT_FIRST_PREFIX = "  \u23BF  ";
+var DEFAULT_REST_PREFIX = "     ";
 function splitOutputLines(output) {
   const lines = output.split(`
 `);
@@ -34559,11 +34978,13 @@ function shouldCollapseOutput(output, maxChars, maxLines = DEFAULT_COLLAPSED_LIN
   const lines = splitOutputLines(clipped.displayOutput);
   return clipped.clippedByChars || lines.length > maxLines;
 }
-var CollapsedOutputDisplay = import_react32.memo(({
+var CollapsedOutputDisplay = import_react33.memo(({
   output,
   maxLines = DEFAULT_COLLAPSED_LINES,
   maxChars,
-  hintText
+  hintText,
+  firstLinePrefix = DEFAULT_FIRST_PREFIX,
+  restLinePrefix = DEFAULT_REST_PREFIX
 }) => {
   const clipped = clipOutputByChars(output, maxChars);
   const lines = splitOutputLines(clipped.displayOutput);
@@ -34574,60 +34995,61 @@ var CollapsedOutputDisplay = import_react32.memo(({
   const visibleLines = showAll ? lines : lines.slice(0, maxLines);
   const hiddenCount = showAll ? 0 : Math.max(0, lines.length - maxLines);
   const hintSuffix = hintText ? `, ${hintText}` : "";
-  return /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+  const prefixWidth = Math.max(firstLinePrefix.length, restLinePrefix.length);
+  return /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
     flexDirection: "column",
     children: [
-      /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+      /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
         flexDirection: "row",
         children: [
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
-            width: PREFIX_WIDTH,
+          prefixWidth > 0 ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
+            width: prefixWidth,
             flexShrink: 0,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
-              children: "  \u23BF  "
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
+              children: firstLinePrefix
             }, undefined, false, undefined, this)
-          }, undefined, false, undefined, this),
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+          }, undefined, false, undefined, this) : null,
+          /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
             flexGrow: 1,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
               color: colors.event.body,
               children: visibleLines[0] ?? ""
             }, undefined, false, undefined, this)
           }, undefined, false, undefined, this)
         ]
       }, undefined, true, undefined, this),
-      visibleLines.slice(1).map((line, index) => /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+      visibleLines.slice(1).map((line, index) => /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
         flexDirection: "row",
         children: [
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
-            width: PREFIX_WIDTH,
+          prefixWidth > 0 ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
+            width: prefixWidth,
             flexShrink: 0,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
-              children: "     "
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
+              children: restLinePrefix
             }, undefined, false, undefined, this)
-          }, undefined, false, undefined, this),
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+          }, undefined, false, undefined, this) : null,
+          /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
             flexGrow: 1,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
               color: colors.event.body,
               children: line
             }, undefined, false, undefined, this)
           }, undefined, false, undefined, this)
         ]
       }, `${index}-${line}`, true, undefined, this)),
-      hiddenCount > 0 ? /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+      hiddenCount > 0 ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
         flexDirection: "row",
         children: [
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
-            width: PREFIX_WIDTH,
+          prefixWidth > 0 ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
+            width: prefixWidth,
             flexShrink: 0,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
-              children: "     "
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
+              children: restLinePrefix
             }, undefined, false, undefined, this)
-          }, undefined, false, undefined, this),
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+          }, undefined, false, undefined, this) : null,
+          /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
             flexGrow: 1,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
               color: colors.event.hint,
               dimColor: true,
               children: [
@@ -34640,19 +35062,19 @@ var CollapsedOutputDisplay = import_react32.memo(({
             }, undefined, true, undefined, this)
           }, undefined, false, undefined, this)
         ]
-      }, undefined, true, undefined, this) : clipped.clippedByChars ? /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+      }, undefined, true, undefined, this) : clipped.clippedByChars ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
         flexDirection: "row",
         children: [
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
-            width: PREFIX_WIDTH,
+          prefixWidth > 0 ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
+            width: prefixWidth,
             flexShrink: 0,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
-              children: "     "
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
+              children: restLinePrefix
             }, undefined, false, undefined, this)
-          }, undefined, false, undefined, this),
-          /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Box_default, {
+          }, undefined, false, undefined, this) : null,
+          /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
             flexGrow: 1,
-            children: /* @__PURE__ */ jsx_dev_runtime12.jsxDEV(Text2, {
+            children: /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
               color: colors.event.hint,
               dimColor: true,
               children: [
@@ -34669,325 +35091,9 @@ var CollapsedOutputDisplay = import_react32.memo(({
 });
 CollapsedOutputDisplay.displayName = "CollapsedOutputDisplay";
 
-// src/tui/components/AssistantMessage.tsx
-var jsx_dev_runtime13 = __toESM(require_jsx_dev_runtime(), 1);
-var AssistantMessage = import_react33.memo(({
-  line,
-  expanded = true,
-  maxPreviewChars,
-  maxPreviewLines = 4
-}) => {
-  const { shouldAnimate } = useAnimation();
-  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimate;
-  const [cursorVisible, setCursorVisible] = import_react33.useState(false);
-  const [thinkingFrame, setThinkingFrame] = import_react33.useState(0);
-  import_react33.useEffect(() => {
-    if (!animate || line.phase !== "streaming" || line.text.trim().length === 0) {
-      setCursorVisible(false);
-      return;
-    }
-    setCursorVisible(true);
-    const timer = setInterval(() => {
-      setCursorVisible((current) => !current);
-    }, 260);
-    return () => clearInterval(timer);
-  }, [animate, line.id, line.phase]);
-  const hasText = line.text.trim().length > 0;
-  import_react33.useEffect(() => {
-    if (!animate || line.phase !== "streaming" || hasText) {
-      setThinkingFrame(0);
-      return;
-    }
-    const timer = setInterval(() => {
-      setThinkingFrame((current) => (current + 1) % 4);
-    }, 280);
-    return () => clearInterval(timer);
-  }, [animate, hasText, line.phase]);
-  if (!hasText && line.phase !== "streaming") {
-    return null;
-  }
-  const thinkingDots = animate ? ".".repeat(thinkingFrame + 1) : "...";
-  const thinkingText = `Thinking${thinkingDots}`;
-  const collapsed = line.phase !== "streaming" && !expanded && shouldCollapseOutput(line.text, maxPreviewChars, maxPreviewLines);
-  const canCollapse = line.phase !== "streaming" && shouldCollapseOutput(line.text, maxPreviewChars, maxPreviewLines);
-  return /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Box_default, {
-    flexDirection: "column",
-    children: [
-      collapsed ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(CollapsedOutputDisplay, {
-        output: line.text,
-        maxLines: maxPreviewLines,
-        maxChars: maxPreviewChars,
-        hintText: expandToolsHint("expand")
-      }, undefined, false, undefined, this) : hasText ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(MarkdownText, {
-        text: line.text
-      }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
-        color: colors.event.hint,
-        dimColor: true,
-        italic: true,
-        children: thinkingText
-      }, undefined, false, undefined, this),
-      expanded && canCollapse ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
-        color: colors.customMessage.hint,
-        dimColor: true,
-        children: [
-          "(",
-          expandToolsHint("collapse"),
-          ")"
-        ]
-      }, undefined, true, undefined, this) : null,
-      line.phase === "streaming" && cursorVisible && hasText ? /* @__PURE__ */ jsx_dev_runtime13.jsxDEV(Text2, {
-        color: colors.event.worker,
-        children: "\u258B"
-      }, undefined, false, undefined, this) : null
-    ]
-  }, undefined, true, undefined, this);
-});
-AssistantMessage.displayName = "AssistantMessage";
-
-// src/tui/components/BlinkDot.tsx
+// src/tui/components/FlowingRoleLabel.tsx
 var import_react34 = __toESM(require_react(), 1);
 var jsx_dev_runtime14 = __toESM(require_jsx_dev_runtime(), 1);
-var BlinkDot = import_react34.memo(({
-  color = colors.tool.pending,
-  symbol = "\u25CF",
-  shouldAnimate = true
-}) => {
-  const { shouldAnimate: shouldAnimateContext } = useAnimation();
-  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimateContext && shouldAnimate !== false;
-  const [on, setOn] = import_react34.useState(true);
-  import_react34.useEffect(() => {
-    if (!animate) {
-      setOn(true);
-      return;
-    }
-    const timer = setInterval(() => setOn((value) => !value), 400);
-    return () => clearInterval(timer);
-  }, [animate]);
-  return /* @__PURE__ */ jsx_dev_runtime14.jsxDEV(Text2, {
-    color,
-    children: on || !animate ? symbol : " "
-  }, undefined, false, undefined, this);
-});
-BlinkDot.displayName = "BlinkDot";
-
-// src/tui/components/CommandMessage.tsx
-var import_react35 = __toESM(require_react(), 1);
-var jsx_dev_runtime15 = __toESM(require_jsx_dev_runtime(), 1);
-var RUNNING_FRAMES = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C", "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"];
-var COMMAND_PREVIEW_LINES = 20;
-function normalizeOutput(output) {
-  return output.replace(/\r\n/g, `
-`).replace(/\r/g, `
-`);
-}
-function getBorderColor(line) {
-  if (line.phase === "running") {
-    return colors.command.running;
-  }
-  if (line.success === false || line.exitCode === null) {
-    return colors.command.error;
-  }
-  return colors.input.divider;
-}
-function getOutputColor(line) {
-  return line.dimOutput ? colors.event.hint : colors.event.body;
-}
-function formatExitStatus(exitCode) {
-  if (typeof exitCode === "number") {
-    return `(exit ${exitCode})`;
-  }
-  if (exitCode === null) {
-    return "(exit ?)";
-  }
-  return "";
-}
-function splitLines(text) {
-  if (!text) {
-    return [];
-  }
-  const lines = text.split(`
-`);
-  if (lines.length > 0 && lines[lines.length - 1] === "") {
-    lines.pop();
-  }
-  return lines;
-}
-var CommandMessage = import_react35.memo(({
-  line,
-  expanded = false,
-  maxPreviewLines = COMMAND_PREVIEW_LINES,
-  variant = "card"
-}) => {
-  const columns = useTerminalWidth();
-  const [runningFrame, setRunningFrame] = import_react35.useState(0);
-  const { shouldAnimate } = useAnimation();
-  const animateSpinner = TUI_ANIMATIONS_ENABLED && shouldAnimate;
-  import_react35.useEffect(() => {
-    if (line.phase !== "running" || !animateSpinner) {
-      setRunningFrame(0);
-      return;
-    }
-    const timer = setInterval(() => {
-      setRunningFrame((value) => (value + 1) % RUNNING_FRAMES.length);
-    }, 120);
-    return () => clearInterval(timer);
-  }, [animateSpinner, line.id, line.phase]);
-  if (line.phase === "waiting") {
-    return null;
-  }
-  const normalizedOutput = import_react35.useMemo(() => normalizeOutput(line.output), [line.output]);
-  const allLines = import_react35.useMemo(() => splitLines(normalizedOutput), [normalizedOutput]);
-  const previewLines = expanded ? allLines : allLines.slice(-Math.max(1, maxPreviewLines));
-  const hiddenLineCount = Math.max(0, allLines.length - previewLines.length);
-  const borderColor = getBorderColor(line);
-  const outputColor = getOutputColor(line);
-  const spinner = RUNNING_FRAMES[runningFrame] ?? RUNNING_FRAMES[0];
-  const hasOutput = previewLines.length > 0;
-  const hasCollapsedOutput = hiddenLineCount > 0;
-  const statusGlyph = line.phase === "running" ? "\u25B8" : line.success === false ? "\u2717" : "\u2713";
-  const statusColor = line.phase === "running" ? colors.command.running : line.success === false ? colors.command.error : colors.command.success;
-  if (variant === "timeline") {
-    return /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-      flexDirection: "column",
-      children: [
-        /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          flexDirection: "row",
-          flexWrap: "wrap",
-          children: [
-            /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-              color: statusColor,
-              children: statusGlyph
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-              children: " "
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-              color: colors.event.hint,
-              children: "command"
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-              children: " "
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-              color: colors.event.worker,
-              bold: true,
-              children: line.input
-            }, undefined, false, undefined, this)
-          ]
-        }, undefined, true, undefined, this),
-        hasOutput ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          marginLeft: 2,
-          flexDirection: "column",
-          children: previewLines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-            color: outputColor,
-            children: entry
-          }, `${line.id}-out-${index}-${entry}`, false, undefined, this))
-        }, undefined, false, undefined, this) : null,
-        line.phase === "running" ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          marginLeft: 2,
-          children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-            color: colors.command.running,
-            children: animateSpinner ? `${spinner} Running... (Esc to cancel)` : "Running... (Esc to cancel)"
-          }, undefined, false, undefined, this)
-        }, undefined, false, undefined, this) : null,
-        line.phase !== "running" && hasCollapsedOutput && !expanded ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          marginLeft: 2,
-          children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-            color: colors.event.hint,
-            dimColor: true,
-            children: [
-              "... ",
-              hiddenLineCount,
-              " more lines (",
-              expandToolsHint("expand"),
-              ")"
-            ]
-          }, undefined, true, undefined, this)
-        }, undefined, false, undefined, this) : null,
-        line.phase !== "running" && hasCollapsedOutput && expanded ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          marginLeft: 2,
-          children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-            color: colors.event.hint,
-            dimColor: true,
-            children: [
-              "(",
-              expandToolsHint("collapse"),
-              ")"
-            ]
-          }, undefined, true, undefined, this)
-        }, undefined, false, undefined, this) : null,
-        line.phase !== "running" && (line.success === false || line.exitCode === null) ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-          marginLeft: 2,
-          children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-            color: colors.command.error,
-            children: formatExitStatus(line.exitCode)
-          }, undefined, false, undefined, this)
-        }, undefined, false, undefined, this) : null
-      ]
-    }, undefined, true, undefined, this);
-  }
-  return /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-    flexDirection: "column",
-    children: [
-      /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: borderColor,
-        children: "\u2500".repeat(Math.max(1, columns))
-      }, undefined, false, undefined, this),
-      /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: colors.event.worker,
-        bold: true,
-        children: line.input
-      }, undefined, false, undefined, this),
-      hasOutput ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
-        flexDirection: "column",
-        children: previewLines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-          color: outputColor,
-          children: entry
-        }, `${line.id}-out-${index}-${entry}`, false, undefined, this))
-      }, undefined, false, undefined, this) : null,
-      line.phase === "running" ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: colors.command.running,
-        children: animateSpinner ? `${spinner} Running... (Esc to cancel)` : "Running... (Esc to cancel)"
-      }, undefined, false, undefined, this) : null,
-      line.phase !== "running" && hasCollapsedOutput && !expanded ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: colors.event.hint,
-        dimColor: true,
-        children: [
-          "... ",
-          hiddenLineCount,
-          " more lines (",
-          expandToolsHint("expand"),
-          ")"
-        ]
-      }, undefined, true, undefined, this) : null,
-      line.phase !== "running" && hasCollapsedOutput && expanded ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: colors.event.hint,
-        dimColor: true,
-        children: [
-          "(",
-          expandToolsHint("collapse"),
-          ")"
-        ]
-      }, undefined, true, undefined, this) : null,
-      line.phase !== "running" && (line.success === false || line.exitCode === null) ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: colors.command.error,
-        children: formatExitStatus(line.exitCode)
-      }, undefined, false, undefined, this) : null,
-      /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
-        color: borderColor,
-        children: "\u2500".repeat(Math.max(1, columns))
-      }, undefined, false, undefined, this)
-    ]
-  }, undefined, true, undefined, this);
-});
-CommandMessage.displayName = "CommandMessage";
-
-// src/tui/components/EventStreamLine.tsx
-var import_react37 = __toESM(require_react(), 1);
-
-// src/tui/components/FlowingRoleLabel.tsx
-var import_react36 = __toESM(require_react(), 1);
-var jsx_dev_runtime16 = __toESM(require_jsx_dev_runtime(), 1);
 var tick2 = 0;
 var listeners2 = new Set;
 var tickerInterval2 = null;
@@ -35029,7 +35135,7 @@ function withStableCharIds(text) {
     };
   });
 }
-var FlowingRoleLabel = import_react36.memo(({
+var FlowingRoleLabel = import_react34.memo(({
   text,
   palette,
   staticColor,
@@ -35037,16 +35143,16 @@ var FlowingRoleLabel = import_react36.memo(({
 }) => {
   const { shouldAnimate: shouldAnimateContext } = useAnimation();
   const shouldAnimate = animate && shouldAnimateContext && TUI_ANIMATIONS_ENABLED;
-  const frameTick = import_react36.useSyncExternalStore(shouldAnimate ? subscribe2 : subscribeIdle2, shouldAnimate ? getSnapshot2 : getStaticSnapshot2);
+  const frameTick = import_react34.useSyncExternalStore(shouldAnimate ? subscribe2 : subscribeIdle2, shouldAnimate ? getSnapshot2 : getStaticSnapshot2);
   const chars = withStableCharIds(text);
   if (!shouldAnimate || palette.length === 0) {
-    return /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+    return /* @__PURE__ */ jsx_dev_runtime14.jsxDEV(Text2, {
       color: staticColor,
       children: text
     }, undefined, false, undefined, this);
   }
-  return /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
-    children: chars.map((item, position) => /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+  return /* @__PURE__ */ jsx_dev_runtime14.jsxDEV(Text2, {
+    children: chars.map((item, position) => /* @__PURE__ */ jsx_dev_runtime14.jsxDEV(Text2, {
       color: palette[(frameTick + position) % palette.length],
       children: item.char
     }, item.id, false, undefined, this))
@@ -35054,7 +35160,541 @@ var FlowingRoleLabel = import_react36.memo(({
 });
 FlowingRoleLabel.displayName = "FlowingRoleLabel";
 
+// src/tui/components/useAnimationTick.ts
+var import_react35 = __toESM(require_react(), 1);
+var tick3 = 0;
+var listeners3 = new Set;
+var tickerInterval3 = null;
+function subscribe3(callback) {
+  listeners3.add(callback);
+  if (!tickerInterval3) {
+    tickerInterval3 = setInterval(() => {
+      tick3 += 1;
+      for (const listener of listeners3) {
+        listener();
+      }
+    }, 120);
+  }
+  return () => {
+    listeners3.delete(callback);
+    if (listeners3.size === 0 && tickerInterval3) {
+      clearInterval(tickerInterval3);
+      tickerInterval3 = null;
+    }
+  };
+}
+function getSnapshot3() {
+  return tick3;
+}
+function subscribeIdle3() {
+  return () => {};
+}
+function getStaticSnapshot3() {
+  return 0;
+}
+function useAnimationTick(animate) {
+  const { shouldAnimate } = useAnimation();
+  const shouldTick = animate && shouldAnimate && TUI_ANIMATIONS_ENABLED;
+  return import_react35.useSyncExternalStore(shouldTick ? subscribe3 : subscribeIdle3, shouldTick ? getSnapshot3 : getStaticSnapshot3);
+}
+
+// src/tui/components/AssistantMessage.tsx
+var jsx_dev_runtime15 = __toESM(require_jsx_dev_runtime(), 1);
+var AssistantMessage = import_react36.memo(({
+  line,
+  expanded = true,
+  maxPreviewChars,
+  maxPreviewLines = 4
+}) => {
+  const { shouldAnimate } = useAnimation();
+  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimate;
+  const [cursorVisible, setCursorVisible] = import_react36.useState(false);
+  const [thinkingFrame, setThinkingFrame] = import_react36.useState(0);
+  import_react36.useEffect(() => {
+    if (!animate || line.phase !== "streaming" || line.text.trim().length === 0) {
+      setCursorVisible(false);
+      return;
+    }
+    setCursorVisible(true);
+    const timer = setInterval(() => {
+      setCursorVisible((current) => !current);
+    }, 260);
+    return () => clearInterval(timer);
+  }, [animate, line.id, line.phase]);
+  const hasText = line.text.trim().length > 0;
+  import_react36.useEffect(() => {
+    if (!animate || line.phase !== "streaming" || hasText) {
+      setThinkingFrame(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setThinkingFrame((current) => (current + 1) % 4);
+    }, 280);
+    return () => clearInterval(timer);
+  }, [animate, hasText, line.phase]);
+  if (!hasText && line.phase !== "streaming") {
+    return null;
+  }
+  const thinkingDots = animate ? ".".repeat(thinkingFrame + 1) : "...";
+  const thinkingText = `Thinking${thinkingDots}`;
+  const collapsed = line.phase !== "streaming" && !expanded && shouldCollapseOutput(line.text, maxPreviewChars, maxPreviewLines);
+  const canCollapse = line.phase !== "streaming" && shouldCollapseOutput(line.text, maxPreviewChars, maxPreviewLines);
+  const frameTick = useAnimationTick(line.phase === "streaming");
+  const railFrames = ["\u258F", "\u258E", "\u258D", "\u258E"];
+  const railSymbol = line.phase === "streaming" && animate ? railFrames[frameTick % railFrames.length] ?? "\u258E" : "\u258F";
+  return /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+    flexDirection: "column",
+    children: [
+      /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: line.phase === "streaming" ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(BlinkDot, {
+              color: colors.event.worker,
+              symbol: "\u25CF",
+              shouldAnimate: animate
+            }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+              color: colors.event.worker,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: "message"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(FlowingRoleLabel, {
+            text: "assistant",
+            staticColor: colors.event.worker,
+            palette: colors.event.roleFlow.worker,
+            animate: line.phase === "streaming"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "\xB7",
+              " "
+            ]
+          }, undefined, true, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: line.phase === "streaming" ? "streaming" : "final"
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this),
+      /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+              color: colors.event.worker,
+              dimColor: true,
+              children: railSymbol
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+            flexGrow: 1,
+            children: collapsed ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(CollapsedOutputDisplay, {
+              output: line.text,
+              maxLines: maxPreviewLines,
+              maxChars: maxPreviewChars,
+              hintText: expandToolsHint("expand"),
+              firstLinePrefix: "",
+              restLinePrefix: ""
+            }, undefined, false, undefined, this) : hasText ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(MarkdownText, {
+              text: line.text
+            }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              italic: true,
+              children: thinkingText
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this),
+      expanded && canCollapse ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+              color: colors.event.worker,
+              dimColor: true,
+              children: railSymbol
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.customMessage.hint,
+            dimColor: true,
+            children: [
+              "(",
+              expandToolsHint("collapse"),
+              ")"
+            ]
+          }, undefined, true, undefined, this)
+        ]
+      }, undefined, true, undefined, this) : null,
+      line.phase === "streaming" && cursorVisible && hasText ? /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+              color: colors.event.worker,
+              dimColor: true,
+              children: railSymbol
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime15.jsxDEV(Text2, {
+            color: colors.event.worker,
+            children: "\u258B"
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this) : null
+    ]
+  }, undefined, true, undefined, this);
+});
+AssistantMessage.displayName = "AssistantMessage";
+
+// src/tui/components/CommandMessage.tsx
+var import_react37 = __toESM(require_react(), 1);
+var jsx_dev_runtime16 = __toESM(require_jsx_dev_runtime(), 1);
+var RUNNING_FRAMES = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C", "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"];
+var COMMAND_PREVIEW_LINES = 20;
+function normalizeOutput(output) {
+  return output.replace(/\r\n/g, `
+`).replace(/\r/g, `
+`);
+}
+function getBorderColor(line) {
+  if (line.phase === "running") {
+    return colors.command.running;
+  }
+  if (line.success === false || line.exitCode === null) {
+    return colors.command.error;
+  }
+  return colors.input.divider;
+}
+function getOutputColor(line) {
+  return line.dimOutput ? colors.event.hint : colors.event.body;
+}
+function formatExitStatus(exitCode) {
+  if (typeof exitCode === "number") {
+    return `(exit ${exitCode})`;
+  }
+  if (exitCode === null) {
+    return "(exit ?)";
+  }
+  return "";
+}
+function splitLines(text) {
+  if (!text) {
+    return [];
+  }
+  const lines = text.split(`
+`);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
+}
+var CommandMessage = import_react37.memo(({
+  line,
+  expanded = false,
+  maxPreviewLines = COMMAND_PREVIEW_LINES,
+  variant = "card"
+}) => {
+  const columns = useTerminalWidth();
+  const [runningFrame, setRunningFrame] = import_react37.useState(0);
+  const { shouldAnimate } = useAnimation();
+  const animateSpinner = TUI_ANIMATIONS_ENABLED && shouldAnimate;
+  import_react37.useEffect(() => {
+    if (line.phase !== "running" || !animateSpinner) {
+      setRunningFrame(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setRunningFrame((value) => (value + 1) % RUNNING_FRAMES.length);
+    }, 120);
+    return () => clearInterval(timer);
+  }, [animateSpinner, line.id, line.phase]);
+  if (line.phase === "waiting") {
+    return null;
+  }
+  const normalizedOutput = import_react37.useMemo(() => normalizeOutput(line.output), [line.output]);
+  const allLines = import_react37.useMemo(() => splitLines(normalizedOutput), [normalizedOutput]);
+  const previewLines = expanded ? allLines : allLines.slice(-Math.max(1, maxPreviewLines));
+  const hiddenLineCount = Math.max(0, allLines.length - previewLines.length);
+  const borderColor = getBorderColor(line);
+  const outputColor = getOutputColor(line);
+  const spinner = RUNNING_FRAMES[runningFrame] ?? RUNNING_FRAMES[0];
+  const hasOutput = previewLines.length > 0;
+  const hasCollapsedOutput = hiddenLineCount > 0;
+  const statusGlyph = line.phase === "running" ? "\u25B8" : line.success === false ? "\u2717" : "\u2713";
+  const statusColor = line.phase === "running" ? colors.command.running : line.success === false ? colors.command.error : colors.command.success;
+  const statusLabel = line.phase === "running" ? "running" : line.success === false || line.exitCode === null ? "failed" : "completed";
+  const frameTick = useAnimationTick(line.phase === "running");
+  const railFrames = ["\u258F", "\u258E", "\u258D", "\u258E"];
+  const railSymbol = line.phase === "running" ? railFrames[frameTick % railFrames.length] ?? "\u258E" : "\u258F";
+  if (variant === "timeline") {
+    return /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+      flexDirection: "column",
+      children: [
+        /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          flexWrap: "wrap",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                children: line.phase === "running" && animateSpinner ? spinner : "\u258C"
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              children: "tool"
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              children: " "
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.bracket,
+              children: "["
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(FlowingRoleLabel, {
+              text: "command",
+              staticColor: colors.event.worker,
+              palette: colors.event.roleFlow.worker,
+              animate: line.phase === "running"
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.bracket,
+              children: "]"
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              children: [
+                " ",
+                "\xB7",
+                " "
+              ]
+            }, undefined, true, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: statusColor,
+              children: statusLabel
+            }, undefined, false, undefined, this),
+            line.phase === "running" ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              children: [
+                " ",
+                "(",
+                formatKeyHint("esc", "to cancel"),
+                ")"
+              ]
+            }, undefined, true, undefined, this) : null
+          ]
+        }, undefined, true, undefined, this),
+        /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                dimColor: true,
+                children: railSymbol
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              flexGrow: 1,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: colors.event.worker,
+                bold: true,
+                children: line.input
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this)
+          ]
+        }, undefined, true, undefined, this),
+        hasOutput ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                dimColor: true,
+                children: railSymbol
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              flexGrow: 1,
+              flexDirection: "column",
+              children: previewLines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: outputColor,
+                children: entry
+              }, `${line.id}-out-${index}-${entry}`, false, undefined, this))
+            }, undefined, false, undefined, this)
+          ]
+        }, undefined, true, undefined, this) : null,
+        line.phase !== "running" && hasCollapsedOutput && !expanded ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                dimColor: true,
+                children: railSymbol
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              children: [
+                "... ",
+                hiddenLineCount,
+                " more lines (",
+                expandToolsHint("expand"),
+                ")"
+              ]
+            }, undefined, true, undefined, this)
+          ]
+        }, undefined, true, undefined, this) : null,
+        line.phase !== "running" && hasCollapsedOutput && expanded ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                dimColor: true,
+                children: railSymbol
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.event.hint,
+              dimColor: true,
+              children: [
+                "(",
+                expandToolsHint("collapse"),
+                ")"
+              ]
+            }, undefined, true, undefined, this)
+          ]
+        }, undefined, true, undefined, this) : null,
+        line.phase !== "running" && (line.success === false || line.exitCode === null) ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+          flexDirection: "row",
+          children: [
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+              width: 2,
+              flexShrink: 0,
+              children: /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+                color: statusColor,
+                dimColor: true,
+                children: railSymbol
+              }, undefined, false, undefined, this)
+            }, undefined, false, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+              color: colors.command.error,
+              children: [
+                statusGlyph,
+                " ",
+                formatExitStatus(line.exitCode)
+              ]
+            }, undefined, true, undefined, this)
+          ]
+        }, undefined, true, undefined, this) : null
+      ]
+    }, undefined, true, undefined, this);
+  }
+  return /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+    flexDirection: "column",
+    children: [
+      /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: borderColor,
+        children: "\u2500".repeat(Math.max(1, columns))
+      }, undefined, false, undefined, this),
+      /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: colors.event.worker,
+        bold: true,
+        children: line.input
+      }, undefined, false, undefined, this),
+      hasOutput ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Box_default, {
+        flexDirection: "column",
+        children: previewLines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+          color: outputColor,
+          children: entry
+        }, `${line.id}-out-${index}-${entry}`, false, undefined, this))
+      }, undefined, false, undefined, this) : null,
+      line.phase === "running" ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: colors.command.running,
+        children: animateSpinner ? `${spinner} Running... (Esc to cancel)` : "Running... (Esc to cancel)"
+      }, undefined, false, undefined, this) : null,
+      line.phase !== "running" && hasCollapsedOutput && !expanded ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: colors.event.hint,
+        dimColor: true,
+        children: [
+          "... ",
+          hiddenLineCount,
+          " more lines (",
+          expandToolsHint("expand"),
+          ")"
+        ]
+      }, undefined, true, undefined, this) : null,
+      line.phase !== "running" && hasCollapsedOutput && expanded ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: colors.event.hint,
+        dimColor: true,
+        children: [
+          "(",
+          expandToolsHint("collapse"),
+          ")"
+        ]
+      }, undefined, true, undefined, this) : null,
+      line.phase !== "running" && (line.success === false || line.exitCode === null) ? /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: colors.command.error,
+        children: formatExitStatus(line.exitCode)
+      }, undefined, false, undefined, this) : null,
+      /* @__PURE__ */ jsx_dev_runtime16.jsxDEV(Text2, {
+        color: borderColor,
+        children: "\u2500".repeat(Math.max(1, columns))
+      }, undefined, false, undefined, this)
+    ]
+  }, undefined, true, undefined, this);
+});
+CommandMessage.displayName = "CommandMessage";
+
 // src/tui/components/EventStreamLine.tsx
+var import_react38 = __toESM(require_react(), 1);
 var jsx_dev_runtime17 = __toESM(require_jsx_dev_runtime(), 1);
 var EVENT_PREFIX_PATTERN = /^(\d{2}:\d{2}:\d{2}) \[(worker|supervisor|system)\] ?(.*)$/;
 function parseEventPrefix(line) {
@@ -35123,7 +35763,16 @@ function renderRole(props) {
     children: "system"
   }, undefined, false, undefined, this);
 }
-var EventStreamLine = import_react37.memo(({
+function getRoleColor(role) {
+  if (role === "worker") {
+    return colors.event.worker;
+  }
+  if (role === "supervisor") {
+    return colors.event.supervisor;
+  }
+  return colors.event.system;
+}
+var EventStreamLine = import_react38.memo(({
   line,
   expanded,
   maxPreviewChars,
@@ -35140,108 +35789,201 @@ var EventStreamLine = import_react37.memo(({
   const role = parsedFirst?.role ?? "system";
   const body = extractEventBody(line);
   const showActiveDot = animate && (role === "worker" || role === "supervisor") && activeThreadRole === role;
+  const roleColor = getRoleColor(role);
   const bodyCollapsed = !expanded && shouldCollapseOutput(body, maxPreviewChars, maxPreviewLines);
+  const frameTick = useAnimationTick(showActiveDot);
+  const railFrames = ["\u258F", "\u258E", "\u258D", "\u258E"];
+  const railSymbol = showActiveDot ? railFrames[frameTick % railFrames.length] ?? "\u258E" : "\u258F";
   return /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
     flexDirection: "column",
     children: [
       /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
         flexDirection: "row",
+        flexWrap: "wrap",
         children: [
           /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
             width: 2,
             flexShrink: 0,
             children: showActiveDot ? /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(BlinkDot, {
-              color: role === "worker" ? colors.event.worker : role === "supervisor" ? colors.event.supervisor : colors.event.system,
+              color: roleColor,
               shouldAnimate: animate
             }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
-              color: role === "worker" ? colors.event.worker : role === "supervisor" ? colors.event.supervisor : colors.event.system,
-              children: "\u25CF"
+              color: roleColor,
+              children: "\u258C"
             }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: "event"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          parsedFirst ? renderRole({
+            role: parsedFirst.role,
+            activeThreadRole,
+            animate
+          }) : /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+            color: colors.event.system,
+            children: "system"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
           }, undefined, false, undefined, this),
           parsedFirst ? /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(jsx_dev_runtime17.Fragment, {
             children: [
               /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
-                color: colors.event.timestamp,
+                color: colors.event.hint,
+                dimColor: true,
                 children: [
-                  parsedFirst.stamp,
+                  " ",
+                  "\xB7",
                   " "
                 ]
               }, undefined, true, undefined, this),
               /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
-                color: colors.event.bracket,
-                children: "["
-              }, undefined, false, undefined, this),
-              renderRole({
-                role: parsedFirst.role,
-                activeThreadRole,
-                animate
-              }),
-              /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
-                color: colors.event.bracket,
-                children: "]"
+                color: colors.event.timestamp,
+                children: parsedFirst.stamp
               }, undefined, false, undefined, this)
             ]
-          }, undefined, true, undefined, this) : /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
-            color: colors.event.system,
-            children: "system"
-          }, undefined, false, undefined, this)
+          }, undefined, true, undefined, this) : null
         ]
       }, undefined, true, undefined, this),
-      body ? /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(CollapsedOutputDisplay, {
-        output: body,
-        maxLines: expanded ? Infinity : maxPreviewLines,
-        maxChars: expanded ? undefined : maxPreviewChars,
-        hintText: bodyCollapsed ? expandToolsHint("expand") : undefined
-      }, undefined, false, undefined, this) : null
+      body ? /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Text2, {
+              color: roleColor,
+              dimColor: true,
+              children: railSymbol
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(Box_default, {
+            flexGrow: 1,
+            children: /* @__PURE__ */ jsx_dev_runtime17.jsxDEV(CollapsedOutputDisplay, {
+              output: body,
+              maxLines: expanded ? Infinity : maxPreviewLines,
+              maxChars: expanded ? undefined : maxPreviewChars,
+              hintText: bodyCollapsed ? expandToolsHint("expand") : undefined,
+              firstLinePrefix: "",
+              restLinePrefix: ""
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this) : null
     ]
   }, undefined, true, undefined, this);
 });
 EventStreamLine.displayName = "EventStreamLine";
 
 // src/tui/components/ExpandableDetailsMessage.tsx
-var import_react38 = __toESM(require_react(), 1);
+var import_react39 = __toESM(require_react(), 1);
 var jsx_dev_runtime18 = __toESM(require_jsx_dev_runtime(), 1);
-var ExpandableDetailsMessage = import_react38.memo(({
+function getLabelColor(label) {
+  const normalized = label.trim().toLowerCase();
+  if (normalized === "supervisor") {
+    return colors.event.supervisor;
+  }
+  if (normalized === "plan") {
+    return colors.plan.inProgress;
+  }
+  if (normalized === "diff") {
+    return colors.event.worker;
+  }
+  return colors.customMessage.label;
+}
+function getLabelPalette(label) {
+  const normalized = label.trim().toLowerCase();
+  if (normalized === "supervisor") {
+    return colors.event.roleFlow.supervisor;
+  }
+  return colors.event.roleFlow.worker;
+}
+var ExpandableDetailsMessage = import_react39.memo(({
   label,
   summary,
   content,
   expanded
 }) => {
+  const { shouldAnimate } = useAnimation();
+  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimate;
+  const labelColor = getLabelColor(label);
+  const labelPalette = getLabelPalette(label);
   if (!content.trim()) {
     return null;
   }
   if (!expanded) {
     return /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
-      flexDirection: "row",
-      flexWrap: "wrap",
-      children: [
-        /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
-          color: colors.customMessage.label,
-          children: [
-            "[",
-            label,
-            "]"
-          ]
-        }, undefined, true, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
-          children: " "
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
-          color: colors.customMessage.text,
-          children: summary
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
-          color: colors.customMessage.hint,
-          dimColor: true,
-          children: [
-            " ",
-            "(",
-            expandToolsHint("expand"),
-            ")"
-          ]
-        }, undefined, true, undefined, this)
-      ]
-    }, undefined, true, undefined, this);
+      flexDirection: "column",
+      children: /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+              color: labelColor,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: "detail"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(FlowingRoleLabel, {
+            text: label,
+            staticColor: labelColor,
+            palette: labelPalette,
+            animate
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "\xB7",
+              " "
+            ]
+          }, undefined, true, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.customMessage.text,
+            children: summary
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.customMessage.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "(",
+              expandToolsHint("expand"),
+              ")"
+            ]
+          }, undefined, true, undefined, this)
+        ]
+      }, undefined, true, undefined, this)
+    }, undefined, false, undefined, this);
   }
   return /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
     flexDirection: "column",
@@ -35250,14 +35992,36 @@ var ExpandableDetailsMessage = import_react38.memo(({
         flexDirection: "row",
         flexWrap: "wrap",
         children: [
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+              color: labelColor,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
           /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
-            color: colors.customMessage.label,
-            children: [
-              "[",
-              label,
-              "]"
-            ]
-          }, undefined, true, undefined, this),
+            color: colors.event.hint,
+            dimColor: true,
+            children: "detail"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(FlowingRoleLabel, {
+            text: label,
+            staticColor: labelColor,
+            palette: labelPalette,
+            animate
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this),
           /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
             color: colors.customMessage.hint,
             dimColor: true,
@@ -35270,19 +36034,36 @@ var ExpandableDetailsMessage = import_react38.memo(({
           }, undefined, true, undefined, this)
         ]
       }, undefined, true, undefined, this),
-      /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(MarkdownText, {
-        text: content,
-        baseColor: colors.customMessage.text
-      }, undefined, false, undefined, this)
+      /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Text2, {
+              color: labelColor,
+              dimColor: true,
+              children: "\u258F"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(Box_default, {
+            flexGrow: 1,
+            children: /* @__PURE__ */ jsx_dev_runtime18.jsxDEV(MarkdownText, {
+              text: content,
+              baseColor: colors.customMessage.text
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this)
     ]
   }, undefined, true, undefined, this);
 });
 ExpandableDetailsMessage.displayName = "ExpandableDetailsMessage";
 
 // src/tui/components/UserMessage.tsx
-var import_react39 = __toESM(require_react(), 1);
+var import_react40 = __toESM(require_react(), 1);
 var jsx_dev_runtime19 = __toESM(require_jsx_dev_runtime(), 1);
-var UserMessage = import_react39.memo(({
+var UserMessage = import_react40.memo(({
   line,
   prompt,
   expanded = true,
@@ -35294,30 +36075,88 @@ var UserMessage = import_react39.memo(({
   const lines = normalized.split(`
 `);
   const canCollapse = shouldCollapseOutput(normalized, maxPreviewChars, maxPreviewLines);
+  const title = prompt || (line.id.startsWith("goal-") ? "goal" : "user");
   return /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
     flexDirection: "column",
     children: [
-      prompt ? /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
-        color: colors.userMessage.label,
-        children: prompt
-      }, undefined, false, undefined, this) : null,
-      collapsed ? /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(CollapsedOutputDisplay, {
-        output: normalized,
-        maxLines: maxPreviewLines,
-        maxChars: maxPreviewChars,
-        hintText: expandToolsHint("expand")
-      }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(jsx_dev_runtime19.Fragment, {
+      /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+        flexDirection: "row",
+        flexWrap: "wrap",
         children: [
-          lines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
-            color: colors.userMessage.text,
-            backgroundColor: colors.userMessage.background,
-            children: [
-              " ",
-              entry || " ",
-              " "
-            ]
-          }, `${line.id}-${index}`, true, undefined, this)),
-          expanded && canCollapse ? /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+              color: colors.userMessage.label,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: "message"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+            color: colors.userMessage.label,
+            children: title
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this),
+      /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+              color: colors.userMessage.label,
+              dimColor: true,
+              children: "\u258F"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+            flexGrow: 1,
+            children: collapsed ? /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(CollapsedOutputDisplay, {
+              output: normalized,
+              maxLines: maxPreviewLines,
+              maxChars: maxPreviewChars,
+              hintText: expandToolsHint("expand"),
+              firstLinePrefix: "",
+              restLinePrefix: ""
+            }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+              flexDirection: "column",
+              children: lines.map((entry, index) => /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+                color: colors.userMessage.text,
+                children: entry || " "
+              }, `${line.id}-${index}`, false, undefined, this))
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this),
+      expanded && canCollapse ? /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
+              color: colors.userMessage.label,
+              dimColor: true,
+              children: "\u258F"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime19.jsxDEV(Text2, {
             color: colors.customMessage.hint,
             dimColor: true,
             children: [
@@ -35325,16 +36164,16 @@ var UserMessage = import_react39.memo(({
               expandToolsHint("collapse"),
               ")"
             ]
-          }, undefined, true, undefined, this) : null
+          }, undefined, true, undefined, this)
         ]
-      }, undefined, true, undefined, this)
+      }, undefined, true, undefined, this) : null
     ]
   }, undefined, true, undefined, this);
 });
 UserMessage.displayName = "UserMessage";
 
 // src/tui/components/WorkerHandoffMessage.tsx
-var import_react40 = __toESM(require_react(), 1);
+var import_react41 = __toESM(require_react(), 1);
 var jsx_dev_runtime20 = __toESM(require_jsx_dev_runtime(), 1);
 function formatList(title, entries) {
   if (entries.length === 0) {
@@ -35365,47 +36204,88 @@ function compactSummary(summary) {
   }
   return `${compact2.slice(0, 93)}...`;
 }
-var WorkerHandoffMessage = import_react40.memo(({ handoff, expanded }) => {
+var WorkerHandoffMessage = import_react41.memo(({ handoff, expanded }) => {
+  const { shouldAnimate } = useAnimation();
+  const animate = TUI_ANIMATIONS_ENABLED && shouldAnimate;
   const summary = compactSummary(handoff.summary);
   const completionLabel = handoff.completionClaim ? "yes" : "no";
+  const completionColor = handoff.completionClaim ? colors.customMessage.success : colors.customMessage.warning;
   if (!expanded) {
     return /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
-      flexDirection: "row",
-      flexWrap: "wrap",
-      children: [
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          color: colors.customMessage.label,
-          children: "[handoff]"
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          children: " "
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          color: colors.customMessage.text,
-          children: summary
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          children: " "
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          color: handoff.completionClaim ? colors.customMessage.success : colors.customMessage.warning,
-          children: [
-            "completion: ",
-            completionLabel
-          ]
-        }, undefined, true, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-          color: colors.customMessage.hint,
-          dimColor: true,
-          children: [
-            " ",
-            "(",
-            expandToolsHint("expand"),
-            ")"
-          ]
-        }, undefined, true, undefined, this)
-      ]
-    }, undefined, true, undefined, this);
+      flexDirection: "column",
+      children: /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+              color: colors.customMessage.label,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: "handoff"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            children: " "
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(FlowingRoleLabel, {
+            text: "worker",
+            staticColor: colors.customMessage.label,
+            palette: colors.event.roleFlow.worker,
+            animate
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "\xB7",
+              " "
+            ]
+          }, undefined, true, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.customMessage.text,
+            children: summary
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "\xB7 completion:",
+              " "
+            ]
+          }, undefined, true, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: completionColor,
+            children: completionLabel
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.customMessage.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "(",
+              expandToolsHint("expand"),
+              ")"
+            ]
+          }, undefined, true, undefined, this)
+        ]
+      }, undefined, true, undefined, this)
+    }, undefined, false, undefined, this);
   }
   return /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
     flexDirection: "column",
@@ -35414,15 +36294,47 @@ var WorkerHandoffMessage = import_react40.memo(({ handoff, expanded }) => {
         flexDirection: "row",
         flexWrap: "wrap",
         children: [
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+              color: colors.customMessage.label,
+              children: "\u258C"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
           /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-            color: colors.customMessage.label,
-            children: "[handoff]"
+            color: colors.event.hint,
+            dimColor: true,
+            children: "handoff"
           }, undefined, false, undefined, this),
           /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
             children: " "
           }, undefined, false, undefined, this),
           /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
-            color: handoff.completionClaim ? colors.customMessage.success : colors.customMessage.warning,
+            color: colors.event.bracket,
+            children: "["
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(FlowingRoleLabel, {
+            text: "worker",
+            staticColor: colors.customMessage.label,
+            palette: colors.event.roleFlow.worker,
+            animate
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.bracket,
+            children: "]"
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: colors.event.hint,
+            dimColor: true,
+            children: [
+              " ",
+              "\xB7",
+              " "
+            ]
+          }, undefined, true, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+            color: completionColor,
             children: [
               "completion claim: ",
               completionLabel
@@ -35440,10 +36352,27 @@ var WorkerHandoffMessage = import_react40.memo(({ handoff, expanded }) => {
           }, undefined, true, undefined, this)
         ]
       }, undefined, true, undefined, this),
-      /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(MarkdownText, {
-        text: formatExpandedBody(handoff),
-        baseColor: colors.customMessage.text
-      }, undefined, false, undefined, this)
+      /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+        flexDirection: "row",
+        children: [
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+            width: 2,
+            flexShrink: 0,
+            children: /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Text2, {
+              color: colors.customMessage.label,
+              dimColor: true,
+              children: "\u258F"
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this),
+          /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(Box_default, {
+            flexGrow: 1,
+            children: /* @__PURE__ */ jsx_dev_runtime20.jsxDEV(MarkdownText, {
+              text: formatExpandedBody(handoff),
+              baseColor: colors.customMessage.text
+            }, undefined, false, undefined, this)
+          }, undefined, false, undefined, this)
+        ]
+      }, undefined, true, undefined, this)
     ]
   }, undefined, true, undefined, this);
 });
@@ -35512,6 +36441,24 @@ function parseCommandOutput(rawOutput) {
     }
   ];
 }
+function summarizeCommandEntries(entries) {
+  if (entries.length === 0) {
+    return "no tools";
+  }
+  const running = entries.filter((entry) => entry.phase === "running").length;
+  const failed = entries.filter((entry) => entry.phase === "finished" && entry.success === false).length;
+  const suffixParts = [];
+  if (running > 0) {
+    suffixParts.push(`${running} running`);
+  }
+  if (failed > 0) {
+    suffixParts.push(`${failed} failed`);
+  }
+  if (suffixParts.length > 0) {
+    return `${entries.length} commands (${suffixParts.join(", ")})`;
+  }
+  return `${entries.length} commands`;
+}
 
 // src/tui/App.tsx
 var jsx_dev_runtime21 = __toESM(require_jsx_dev_runtime(), 1);
@@ -35521,8 +36468,10 @@ var MIN_EVENT_STREAM_LINES = 6;
 var RESIZE_SETTLE_DELAY_MS = 220;
 var ANIMATION_RESUME_HYSTERESIS_ROWS = 2;
 var CTRL_SHORTCUT_TOGGLE_DEDUPE_MS = 120;
+var DENSITY_TOGGLE_KEY = "ctrl+u";
 var CTRL_SHORTCUT_CHAR_MAP = {
-  o: "\x0F"
+  o: "\x0F",
+  u: "\x15"
 };
 function matchesCtrlShortcut(typedInput, ctrl, letter) {
   if (typedInput === CTRL_SHORTCUT_CHAR_MAP[letter]) {
@@ -35665,6 +36614,72 @@ function summarizeDiff(diff2) {
   }
   return `+${added} / -${removed} lines`;
 }
+function sanitizeSingleLine(value) {
+  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function truncateSingleLine(value, maxWidth) {
+  const normalized = sanitizeSingleLine(value);
+  if (maxWidth <= 0) {
+    return "";
+  }
+  if (normalized.length <= maxWidth) {
+    return normalized;
+  }
+  if (maxWidth <= 1) {
+    return normalized.slice(0, 1);
+  }
+  return `${normalized.slice(0, maxWidth - 1)}\u2026`;
+}
+function formatCompactCount(value) {
+  if (value < 1000) {
+    return String(value);
+  }
+  if (value < 1e4) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  if (value < 1e6) {
+    return `${Math.round(value / 1000)}k`;
+  }
+  if (value < 1e7) {
+    return `${(value / 1e6).toFixed(1)}M`;
+  }
+  return `${Math.round(value / 1e6)}M`;
+}
+function buildTwoColumnFooterLine(options) {
+  const minGap = Math.max(1, options.minGap ?? 2);
+  const maxWidth = Math.max(1, options.width);
+  let left = sanitizeSingleLine(options.left);
+  let right = sanitizeSingleLine(options.right);
+  if (!right) {
+    return truncateSingleLine(left, maxWidth);
+  }
+  if (!left) {
+    return truncateSingleLine(right, maxWidth);
+  }
+  if (left.length + minGap + right.length <= maxWidth) {
+    return `${left}${" ".repeat(maxWidth - left.length - right.length)}${right}`;
+  }
+  if (right.length >= maxWidth - minGap) {
+    right = truncateSingleLine(right, Math.max(1, maxWidth - minGap));
+    return right;
+  }
+  const availableForLeft = maxWidth - right.length - minGap;
+  left = truncateSingleLine(left, Math.max(1, availableForLeft));
+  if (left.length + minGap + right.length <= maxWidth) {
+    return `${left}${" ".repeat(maxWidth - left.length - right.length)}${right}`;
+  }
+  return truncateSingleLine(`${left} ${right}`, maxWidth);
+}
+function shortId2(value, size2 = 8) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "-";
+  }
+  if (trimmed.length <= size2) {
+    return trimmed;
+  }
+  return trimmed.slice(0, size2);
+}
 function formatCwdForFooter(cwd2) {
   const home = process.env.HOME || process.env.USERPROFILE;
   if (home && cwd2.startsWith(home)) {
@@ -35672,42 +36687,58 @@ function formatCwdForFooter(cwd2) {
   }
   return cwd2;
 }
+var EVENT_PREFIX_PATTERN2 = /^(\d{2}:\d{2}:\d{2}) \[(worker|supervisor|system)\] ?(.*)$/;
+function classifyTransientEventGroup(role, body) {
+  if (role !== "system") {
+    return null;
+  }
+  const normalized = body.trim().toLowerCase();
+  if (normalized.startsWith("transient upstream error during ") && normalized.includes(" retrying (") && normalized.includes(" in ") && normalized.includes("ms")) {
+    return "system:transient-retry";
+  }
+  if (normalized.includes("supervisor strict schema rejected by upstream; retrying once with legacy-compatible schema")) {
+    return "system:schema-fallback-retry";
+  }
+  return null;
+}
 function App2(props) {
   const { exit } = use_app_default();
   const onExitRequest = props.onExitRequest;
   const { stdout } = use_stdout_default();
-  const [snapshot, setSnapshot] = import_react41.useState(props.controller.getSnapshot());
-  const [input, setInput] = import_react41.useState("");
-  const [busy, setBusy] = import_react41.useState(false);
-  const [currentCursorPosition, setCurrentCursorPosition] = import_react41.useState(0);
-  const [cursorNudge, setCursorNudge] = import_react41.useState(undefined);
-  const [isAutocompleteActive, setIsAutocompleteActive] = import_react41.useState(false);
-  const [selectedSlashIndex, setSelectedSlashIndex] = import_react41.useState(0);
-  const [logsExpanded, setLogsExpanded] = import_react41.useState(false);
-  const [overlay, setOverlay] = import_react41.useState(null);
-  const [notice, setNotice] = import_react41.useState(null);
-  const [isResizing, setIsResizing] = import_react41.useState(false);
-  const [viewportAllowsAnimation, setViewportAllowsAnimation] = import_react41.useState(TUI_ANIMATIONS_ENABLED);
-  const inputRef = import_react41.useRef(input);
-  const autocompleteActiveRef = import_react41.useRef(isAutocompleteActive);
-  const lastExpandShortcutAtRef = import_react41.useRef(0);
-  const resizeTimerRef = import_react41.useRef(null);
-  import_react41.useEffect(() => {
+  const [snapshot, setSnapshot] = import_react42.useState(props.controller.getSnapshot());
+  const [input, setInput] = import_react42.useState("");
+  const [busy, setBusy] = import_react42.useState(false);
+  const [currentCursorPosition, setCurrentCursorPosition] = import_react42.useState(0);
+  const [cursorNudge, setCursorNudge] = import_react42.useState(undefined);
+  const [isAutocompleteActive, setIsAutocompleteActive] = import_react42.useState(false);
+  const [selectedSlashIndex, setSelectedSlashIndex] = import_react42.useState(0);
+  const [logsExpanded, setLogsExpanded] = import_react42.useState(false);
+  const [conversationDensity, setConversationDensity] = import_react42.useState("immersive");
+  const [overlay, setOverlay] = import_react42.useState(null);
+  const [notice, setNotice] = import_react42.useState(null);
+  const [isResizing, setIsResizing] = import_react42.useState(false);
+  const [viewportAllowsAnimation, setViewportAllowsAnimation] = import_react42.useState(TUI_ANIMATIONS_ENABLED);
+  const inputRef = import_react42.useRef(input);
+  const autocompleteActiveRef = import_react42.useRef(isAutocompleteActive);
+  const lastExpandShortcutAtRef = import_react42.useRef(0);
+  const lastDensityShortcutAtRef = import_react42.useRef(0);
+  const resizeTimerRef = import_react42.useRef(null);
+  import_react42.useEffect(() => {
     if (!notice) {
       return;
     }
     const timer = setTimeout(() => setNotice(null), 5000);
     return () => clearTimeout(timer);
   }, [notice]);
-  const closeCodexOverlay = import_react41.useCallback((result2) => {
+  const closeCodexOverlay = import_react42.useCallback((result2) => {
     setOverlay(null);
     if (result2?.message) {
       setNotice(result2.message);
     }
   }, []);
-  const slashCommands = import_react41.useMemo(() => getSlashCommands(snapshot.viewerOnly), [snapshot.viewerOnly]);
-  const sessionHotkeys = import_react41.useMemo(() => buildSessionHotkeysMarkdown(snapshot.viewerOnly), [snapshot.viewerOnly]);
-  const changelog = import_react41.useMemo(() => buildChangelogMarkdown(), []);
+  const slashCommands = import_react42.useMemo(() => getSlashCommands(snapshot.viewerOnly), [snapshot.viewerOnly]);
+  const sessionHotkeys = import_react42.useMemo(() => buildSessionHotkeysMarkdown(snapshot.viewerOnly), [snapshot.viewerOnly]);
+  const changelog = import_react42.useMemo(() => buildChangelogMarkdown(), []);
   const executeCommand = async (command) => {
     if (command === "/exit") {
       onExitRequest?.("exit");
@@ -35741,7 +36772,7 @@ function App2(props) {
       setBusy(false);
     }
   };
-  const interruptActiveTurn = import_react41.useCallback(async () => {
+  const interruptActiveTurn = import_react42.useCallback(async () => {
     setBusy(true);
     try {
       await props.controller.interruptActiveTurn();
@@ -35749,7 +36780,7 @@ function App2(props) {
       setBusy(false);
     }
   }, [props.controller]);
-  const completeSlashCommand = import_react41.useCallback((value, cursorPosition = currentCursorPosition) => {
+  const completeSlashCommand = import_react42.useCallback((value, cursorPosition = currentCursorPosition) => {
     const state = buildSlashAutocompleteState(value, slashCommands, cursorPosition);
     if (!state.active || state.matches.length === 0 || busy) {
       return false;
@@ -35764,17 +36795,17 @@ function App2(props) {
     setCursorNudge(completed.length);
     return true;
   }, [busy, currentCursorPosition, selectedSlashIndex, slashCommands]);
-  const completeSlashCommandRef = import_react41.useRef(completeSlashCommand);
-  import_react41.useEffect(() => {
+  const completeSlashCommandRef = import_react42.useRef(completeSlashCommand);
+  import_react42.useEffect(() => {
     inputRef.current = input;
   }, [input]);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     autocompleteActiveRef.current = isAutocompleteActive;
   }, [isAutocompleteActive]);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     completeSlashCommandRef.current = completeSlashCommand;
   }, [completeSlashCommand]);
-  const handleGlobalInput = import_react41.useCallback((typedInput, key) => {
+  const handleGlobalInput = import_react42.useCallback((typedInput, key) => {
     const isEscape = key.escape || typedInput === "\x1B";
     if (overlay) {
       return;
@@ -35788,6 +36819,18 @@ function App2(props) {
       }
       lastExpandShortcutAtRef.current = now2;
       setLogsExpanded((value) => !value);
+      return;
+    }
+    const isCtrlUPlain = isRawCtrlShortcut(typedInput, "u");
+    const isCtrlUModified = matchesCtrlShortcut(typedInput, key.ctrl, "u");
+    if (isCtrlUPlain || isCtrlUModified) {
+      const now2 = Date.now();
+      if (now2 - lastDensityShortcutAtRef.current < CTRL_SHORTCUT_TOGGLE_DEDUPE_MS) {
+        return;
+      }
+      lastDensityShortcutAtRef.current = now2;
+      setConversationDensity((value) => value === "immersive" ? "compact" : "immersive");
+      setNotice(conversationDensity === "immersive" ? "View density: compact" : "View density: immersive");
       return;
     }
     if (isEscape) {
@@ -35818,16 +36861,16 @@ function App2(props) {
         return;
       }
     }
-  }, [exit, interruptActiveTurn, onExitRequest, overlay]);
+  }, [conversationDensity, exit, interruptActiveTurn, onExitRequest, overlay]);
   use_input_default(handleGlobalInput);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     if (cursorNudge === undefined) {
       return;
     }
     const timer = setTimeout(() => setCursorNudge(undefined), 0);
     return () => clearTimeout(timer);
   }, [cursorNudge]);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     let mounted = true;
     props.controller.start();
     const unsubscribe = props.controller.subscribe((next) => {
@@ -35841,7 +36884,7 @@ function App2(props) {
       props.controller.dispose();
     };
   }, [props.controller]);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     if (!stdout || typeof stdout.on !== "function") {
       return;
     }
@@ -35923,23 +36966,71 @@ function App2(props) {
   };
   const terminalColumns = Math.max(40, stdout?.columns ?? 80);
   const terminalRows = Math.max(20, stdout?.rows ?? 40);
-  const horizontalLine = import_react41.useMemo(() => buildHorizontalLine(terminalColumns, "\u2500"), [terminalColumns]);
+  const compactTimeline = conversationDensity === "compact";
+  const sectionGap = compactTimeline ? 0 : 1;
+  const minimizeTopChrome = snapshot.run.status === "completed" && snapshot.activeThreadRole === null && !logsExpanded;
+  const horizontalLine = import_react42.useMemo(() => buildHorizontalLine(terminalColumns, "\u2500"), [terminalColumns]);
   const runAnimating = isRunAnimating(snapshot);
   const runPhaseLabel = getRunPhaseLabel(snapshot);
   const runStatusColor = getRunStatusColor(snapshot.run.status);
   const statusLineLabel = runAnimating ? `${runPhaseLabel}...` : runPhaseLabel;
   const statusLabelPalette = snapshot.activeThreadRole === "worker" ? colors.event.roleFlow.worker : snapshot.activeThreadRole === "supervisor" ? colors.event.roleFlow.supervisor : snapshot.run.status === "blocked" ? colors.event.roleFlow.supervisor : colors.progress.phaseFlow;
-  const eventWindowCap = Math.max(MIN_EVENT_STREAM_LINES, terminalRows - 18);
+  const eventWindowCap = Math.max(MIN_EVENT_STREAM_LINES, terminalRows - (compactTimeline ? 15 : 18));
   const eventWindowSize = Math.min(EVENT_STREAM_MAX_LINES, eventWindowCap);
   const eventLines = snapshot.logs.slice(-eventWindowSize);
-  const keyedEventLines = import_react41.useMemo(() => {
-    const occurrences = new Map;
-    return eventLines.map((line) => {
-      const next = (occurrences.get(line) ?? 0) + 1;
-      occurrences.set(line, next);
+  const keyedEventLines = import_react42.useMemo(() => {
+    const grouped = [];
+    for (const line of eventLines) {
+      const normalized = line.replace(/\r/g, "");
+      const segments = normalized.split(`
+`);
+      const first = segments[0] ?? "";
+      const rest2 = segments.slice(1);
+      const parsed = EVENT_PREFIX_PATTERN2.exec(first);
+      const role = parsed ? parsed[2] : null;
+      const stamp = parsed ? parsed[1] ?? "" : "";
+      const body = parsed ? [parsed[3] ?? "", ...rest2].join(`
+`) : normalized;
+      const transientGroup = classifyTransientEventGroup(role, body);
+      const key = transientGroup ?? (role ? `${role}|${body}` : `raw|${normalized}`);
+      const previous = grouped[grouped.length - 1];
+      if (previous && previous.key === key) {
+        previous.count += 1;
+        if (stamp) {
+          previous.stamp = stamp;
+        }
+        previous.body = body;
+        previous.raw = normalized;
+        continue;
+      }
+      grouped.push({
+        key,
+        count: 1,
+        role,
+        stamp,
+        body,
+        raw: normalized
+      });
+    }
+    return grouped.map((entry, index) => {
+      if (!entry.role) {
+        return {
+          line: entry.count > 1 ? `${entry.raw} (x${entry.count})` : entry.raw,
+          key: `${entry.key}#${index + 1}`
+        };
+      }
+      const bodyLines = entry.body.split(`
+`);
+      const firstBody = bodyLines[0] ?? "";
+      const firstWithCount = entry.count > 1 ? `${firstBody} (x${entry.count})` : firstBody;
+      const rebuilt = [
+        `${entry.stamp} [${entry.role}] ${firstWithCount}`,
+        ...bodyLines.slice(1)
+      ].join(`
+`);
       return {
-        line,
-        key: `${line}#${next}`
+        line: rebuilt,
+        key: `${entry.key}#${index + 1}`
       };
     });
   }, [eventLines]);
@@ -35948,7 +37039,7 @@ function App2(props) {
   const hasCollapsedEventLine = !logsExpanded ? hasEventLines : keyedEventLines.some((entry) => shouldCollapseEventLine(entry.line, eventPreviewChars));
   const planOutput = formatPlanOutput(snapshot.plan);
   const supervisorOutput = snapshot.showSupervisor ? formatSupervisorDecision(snapshot.latestSupervisorDecision) : "";
-  const commandEntries = import_react41.useMemo(() => {
+  const commandEntries = import_react42.useMemo(() => {
     if (snapshot.commandExecutions.length > 0) {
       return snapshot.commandExecutions.map((entry, index) => ({
         id: entry.id || `cmd-${index + 1}`,
@@ -35963,7 +37054,7 @@ function App2(props) {
     return parseCommandOutput(commandOutput);
   }, [snapshot.commandExecutions, snapshot.commandOutput]);
   const showStreamingAssistant = snapshot.activeThreadRole === "worker" && (snapshot.run.status === "working" || snapshot.run.status === "repairing");
-  const diffPreviewLineBudget = Math.max(4, Math.min(DIFF_PREVIEW_COLLAPSED_LINES, terminalRows - 24));
+  const diffPreviewLineBudget = Math.max(compactTimeline ? 3 : 4, Math.min(DIFF_PREVIEW_COLLAPSED_LINES, terminalRows - (compactTimeline ? 20 : 24)));
   const hasCollapsedSupervisor = supervisorOutput.length > 0 && shouldCollapseOutput(supervisorOutput, eventPreviewChars, 3);
   const hasCollapsedDiff = snapshot.diff.length > 0 && shouldCollapseOutput(snapshot.diff, eventPreviewChars, diffPreviewLineBudget);
   const hasCollapsedCommandOutput = !logsExpanded ? commandEntries.length > 0 : commandEntries.some((entry) => entry.output.length > 0 && shouldCollapseOutput(entry.output, undefined, COMMAND_PREVIEW_LINES));
@@ -35976,13 +37067,28 @@ function App2(props) {
     return shouldCollapseOutput(payload.userMessage, eventPreviewChars, diffPreviewLineBudget);
   });
   const hasCollapsedConversationInfo = hasCollapsedGoal || hasCollapsedAssistantMessage || hasCollapsedSupervisor || hasCollapsedDiff || hasCollapsedCommandOutput || hasCollapsedEventLine;
-  const sessionMenuHint = `${formatKeyForDisplay(EXPAND_TOOLS_KEY)} expand tools \xB7 esc interrupt \xB7 /supervisor \xB7 /hotkeys \xB7 /changelog`;
-  const footerPath = formatCwdForFooter(snapshot.agent.cwd);
-  const footerStats = `turns ${snapshot.run.workerTurnCount} \xB7 status ${snapshot.run.status} \xB7 events ${snapshot.logs.length}`;
+  const sessionMenuHintPrimary = [
+    formatKeyHint(EXPAND_TOOLS_KEY, logsExpanded ? "collapse tools" : "expand tools"),
+    formatKeyHint(DENSITY_TOGGLE_KEY, compactTimeline ? "immersive view" : "compact view"),
+    formatKeyHint("esc", "interrupt"),
+    formatKeyHint("tab", "autocomplete")
+  ].join(" \xB7 ");
+  const sessionMenuHintSecondary = "/supervisor on|off \xB7 /memory profile \xB7 /hotkeys \xB7 /changelog";
+  const commandSummary = summarizeCommandEntries(commandEntries);
+  const footerPath = buildTwoColumnFooterLine({
+    width: Math.max(1, terminalColumns - 1),
+    left: formatCwdForFooter(snapshot.agent.cwd),
+    right: `agent ${shortId2(snapshot.agent.id)} \xB7 run ${shortId2(snapshot.run.id)}`
+  });
+  const footerStats = buildTwoColumnFooterLine({
+    width: Math.max(1, terminalColumns - 1),
+    left: `turns ${formatCompactCount(snapshot.run.workerTurnCount)} \xB7 ` + `events ${formatCompactCount(snapshot.logs.length)} \xB7 ` + `${commandSummary}`,
+    right: `${snapshot.activeThreadRole ? `lane ${snapshot.activeThreadRole}` : snapshot.run.status} \xB7 ` + `${snapshot.showSupervisor ? "supervisor on" : "supervisor off"} \xB7 ` + `view ${conversationDensity}`
+  });
   const slashPlaceholder = "Describe what you want to do...";
   const visibleSlashRows = Math.max(8, Math.min(16, terminalRows - 22));
-  const slashAutocompleteState = import_react41.useMemo(() => buildSlashAutocompleteState(input, slashCommands, currentCursorPosition), [currentCursorPosition, input, slashCommands]);
-  const estimatedLiveHeight = import_react41.useMemo(() => {
+  const slashAutocompleteState = import_react42.useMemo(() => buildSlashAutocompleteState(input, slashCommands, currentCursorPosition), [currentCursorPosition, input, slashCommands]);
+  const estimatedLiveHeight = import_react42.useMemo(() => {
     let liveItemsHeight = 0;
     if (showStreamingAssistant) {
       liveItemsHeight += 3;
@@ -36027,7 +37133,7 @@ function App2(props) {
     showStreamingAssistant,
     visibleSlashRows
   ]);
-  import_react41.useEffect(() => {
+  import_react42.useEffect(() => {
     if (!TUI_ANIMATIONS_ENABLED || terminalRows <= 0) {
       setViewportAllowsAnimation(false);
       return;
@@ -36069,54 +37175,68 @@ function App2(props) {
     children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
       flexDirection: "column",
       children: [
-        /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          flexDirection: "row",
+        !minimizeTopChrome ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(jsx_dev_runtime21.Fragment, {
           children: [
             /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-              width: 2,
-              flexShrink: 0,
-              children: runAnimating ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(BlinkDot, {
-                color: colors.progress.spinner,
-                shouldAnimate
-              }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
-                color: runStatusColor,
-                children: getRunStatusSymbol(snapshot.run.status)
+              flexDirection: "row",
+              children: [
+                /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+                  width: 2,
+                  flexShrink: 0,
+                  children: runAnimating ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(BlinkDot, {
+                    color: colors.progress.spinner,
+                    shouldAnimate
+                  }, undefined, false, undefined, this) : /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    color: runStatusColor,
+                    children: getRunStatusSymbol(snapshot.run.status)
+                  }, undefined, false, undefined, this)
+                }, undefined, false, undefined, this),
+                /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(FlowingRoleLabel, {
+                  text: statusLineLabel,
+                  staticColor: runStatusColor,
+                  palette: statusLabelPalette,
+                  animate: shouldAnimateStatusLabel
+                }, undefined, false, undefined, this),
+                /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                  color: colors.event.hint,
+                  dimColor: true,
+                  children: logsExpanded ? ` (${expandToolsHint("collapse")})` : hasCollapsedConversationInfo ? ` (${expandToolsHint("expand")})` : ` (${formatKeyForDisplay(EXPAND_TOOLS_KEY)})`
+                }, undefined, false, undefined, this)
+              ]
+            }, undefined, true, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+              marginLeft: 2,
+              flexDirection: "column",
+              children: [
+                /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                  color: colors.event.hint,
+                  dimColor: true,
+                  wrap: "truncate-end",
+                  children: sessionMenuHintPrimary
+                }, undefined, false, undefined, this),
+                /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                  color: colors.event.hint,
+                  dimColor: true,
+                  wrap: "truncate-end",
+                  children: sessionMenuHintSecondary
+                }, undefined, false, undefined, this)
+              ]
+            }, undefined, true, undefined, this),
+            /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+              marginTop: sectionGap,
+              children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(UserMessage, {
+                line: {
+                  kind: "user",
+                  id: `goal-${snapshot.run.id}`,
+                  text: snapshot.run.goal
+                },
+                expanded: logsExpanded,
+                maxPreviewChars: eventPreviewChars,
+                maxPreviewLines: 3
               }, undefined, false, undefined, this)
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(FlowingRoleLabel, {
-              text: statusLineLabel,
-              staticColor: runStatusColor,
-              palette: statusLabelPalette,
-              animate: shouldAnimateStatusLabel
-            }, undefined, false, undefined, this),
-            /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
-              color: colors.event.hint,
-              dimColor: true,
-              children: logsExpanded ? ` (${expandToolsHint("collapse")})` : hasCollapsedConversationInfo ? ` (${expandToolsHint("expand")})` : ` (${formatKeyForDisplay(EXPAND_TOOLS_KEY)})`
             }, undefined, false, undefined, this)
           ]
-        }, undefined, true, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          marginLeft: 2,
-          children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
-            color: colors.event.hint,
-            dimColor: true,
-            children: sessionMenuHint
-          }, undefined, false, undefined, this)
-        }, undefined, false, undefined, this),
-        /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          marginTop: 1,
-          children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(UserMessage, {
-            line: {
-              kind: "user",
-              id: `goal-${snapshot.run.id}`,
-              text: snapshot.run.goal
-            },
-            expanded: logsExpanded,
-            maxPreviewChars: eventPreviewChars,
-            maxPreviewLines: 3
-          }, undefined, false, undefined, this)
-        }, undefined, false, undefined, this),
+        }, undefined, true, undefined, this) : null,
         notice ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
           marginTop: 1,
           children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
@@ -36129,7 +37249,7 @@ function App2(props) {
           if (entry.threadRole === "worker") {
             const payload2 = entry.payload;
             return /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-              marginTop: 1,
+              marginTop: sectionGap,
               flexDirection: "column",
               children: [
                 /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(AssistantMessage, {
@@ -36144,7 +37264,7 @@ function App2(props) {
                   maxPreviewLines: diffPreviewLineBudget
                 }, undefined, false, undefined, this),
                 /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-                  marginTop: 1,
+                  marginTop: sectionGap,
                   children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(WorkerHandoffMessage, {
                     handoff: payload2.handoff,
                     expanded: logsExpanded
@@ -36162,7 +37282,7 @@ function App2(props) {
             return null;
           }
           return /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-            marginTop: 1,
+            marginTop: sectionGap,
             children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(ExpandableDetailsMessage, {
               label: "supervisor",
               summary: summarizeSupervisorDecision(payload, snapshot.activeThreadRole === "supervisor"),
@@ -36172,7 +37292,7 @@ function App2(props) {
           }, `supervisor-${historyKey}`, false, undefined, this);
         }),
         showStreamingAssistant ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          marginTop: 1,
+          marginTop: sectionGap,
           children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(AssistantMessage, {
             line: {
               kind: "assistant",
@@ -36184,7 +37304,7 @@ function App2(props) {
           }, undefined, false, undefined, this)
         }, undefined, false, undefined, this) : null,
         planOutput ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          marginTop: 1,
+          marginTop: sectionGap,
           children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(ExpandableDetailsMessage, {
             label: "plan",
             summary: summarizePlan(snapshot.plan),
@@ -36193,7 +37313,7 @@ function App2(props) {
           }, undefined, false, undefined, this)
         }, undefined, false, undefined, this) : null,
         snapshot.diff ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-          marginTop: 1,
+          marginTop: sectionGap,
           children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(ExpandableDetailsMessage, {
             label: "diff",
             summary: summarizeDiff(snapshot.diff),
@@ -36205,7 +37325,7 @@ function App2(props) {
           flexDirection: "column",
           children: [
             keyedEventLines.map((entry) => /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-              marginTop: 1,
+              marginTop: sectionGap,
               children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(EventStreamLine, {
                 line: entry.line,
                 expanded: logsExpanded,
@@ -36216,7 +37336,7 @@ function App2(props) {
             }, entry.key, false, undefined, this)),
             logsExpanded && commandEntries.length > 0 ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(jsx_dev_runtime21.Fragment, {
               children: commandEntries.map((entry) => /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
-                marginTop: 1,
+                marginTop: sectionGap,
                 children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(CommandMessage, {
                   line: {
                     kind: "command",
@@ -36234,6 +37354,43 @@ function App2(props) {
                   variant: "timeline"
                 }, undefined, false, undefined, this)
               }, entry.id, false, undefined, this))
+            }, undefined, false, undefined, this) : null,
+            minimizeTopChrome ? /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+              marginTop: sectionGap,
+              children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+                flexDirection: "row",
+                flexWrap: "wrap",
+                children: [
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Box_default, {
+                    width: 2,
+                    flexShrink: 0,
+                    children: /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                      color: runStatusColor,
+                      children: getRunStatusSymbol(snapshot.run.status)
+                    }, undefined, false, undefined, this)
+                  }, undefined, false, undefined, this),
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    color: colors.event.hint,
+                    dimColor: true,
+                    children: "status"
+                  }, undefined, false, undefined, this),
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    children: " "
+                  }, undefined, false, undefined, this),
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    color: colors.event.bracket,
+                    children: "["
+                  }, undefined, false, undefined, this),
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    color: runStatusColor,
+                    children: statusLineLabel
+                  }, undefined, false, undefined, this),
+                  /* @__PURE__ */ jsx_dev_runtime21.jsxDEV(Text2, {
+                    color: colors.event.bracket,
+                    children: "]"
+                  }, undefined, false, undefined, this)
+                ]
+              }, undefined, true, undefined, this)
             }, undefined, false, undefined, this) : null
           ]
         }, undefined, true, undefined, this),
@@ -36319,7 +37476,7 @@ function App2(props) {
 }
 
 // src/tui/ResumePicker.tsx
-var import_react42 = __toESM(require_react(), 1);
+var import_react43 = __toESM(require_react(), 1);
 
 // src/tui/resumePickerSearch.ts
 function normalizeWhitespaceLower(text) {
@@ -36535,14 +37692,14 @@ function formatRelativeTime(iso) {
 function ResumePicker(props) {
   const { exit } = use_app_default();
   const { stdout } = use_stdout_default();
-  const [scope, setScope] = import_react42.useState("current");
-  const [sortMode, setSortMode] = import_react42.useState("recent");
-  const [showDetails, setShowDetails] = import_react42.useState(false);
-  const [selectedIndex, setSelectedIndex] = import_react42.useState(0);
-  const [filterInput, setFilterInput] = import_react42.useState("");
-  const sourceOptions = import_react42.useMemo(() => scope === "current" ? props.preferredOptions : props.allOptions, [scope, props.allOptions, props.preferredOptions]);
-  const filteredOptions = import_react42.useMemo(() => filterAndSortResumeOptions(sourceOptions, filterInput, sortMode), [sourceOptions, filterInput, sortMode]);
-  import_react42.useEffect(() => {
+  const [scope, setScope] = import_react43.useState("current");
+  const [sortMode, setSortMode] = import_react43.useState("recent");
+  const [showDetails, setShowDetails] = import_react43.useState(false);
+  const [selectedIndex, setSelectedIndex] = import_react43.useState(0);
+  const [filterInput, setFilterInput] = import_react43.useState("");
+  const sourceOptions = import_react43.useMemo(() => scope === "current" ? props.preferredOptions : props.allOptions, [scope, props.allOptions, props.preferredOptions]);
+  const filteredOptions = import_react43.useMemo(() => filterAndSortResumeOptions(sourceOptions, filterInput, sortMode), [sourceOptions, filterInput, sortMode]);
+  import_react43.useEffect(() => {
     if (filteredOptions.length === 0) {
       setSelectedIndex(0);
       return;
@@ -36625,7 +37782,7 @@ function ResumePicker(props) {
       return;
     }
   });
-  const visible = import_react42.useMemo(() => {
+  const visible = import_react43.useMemo(() => {
     const total = filteredOptions.length;
     const boundedIndex = Math.min(selectedIndex, Math.max(0, total - 1));
     const needsScroll = total > MAX_VISIBLE_RUNS;
@@ -36640,7 +37797,7 @@ function ResumePicker(props) {
     };
   }, [filteredOptions, selectedIndex]);
   const terminalColumns = Math.max(40, stdout?.columns ?? 80);
-  const horizontalLine = import_react42.useMemo(() => buildHorizontalLine(terminalColumns, "\u2500"), [terminalColumns]);
+  const horizontalLine = import_react43.useMemo(() => buildHorizontalLine(terminalColumns, "\u2500"), [terminalColumns]);
   const metaWidth = Math.max(24, terminalColumns - 6);
   const scopeText = scope === "current" ? "\u25C9 Current Agent | \u25CB All" : `\u25CB Current Agent | \u25C9 All`;
   const sortLabel = sortMode === "recent" ? "Recent" : "Fuzzy";
@@ -37020,4 +38177,4 @@ async function main() {
 }
 await main();
 
-//# debugId=60784A81F49B431764756E2164756E21
+//# debugId=6807BDB4FD4746B164756E2164756E21
