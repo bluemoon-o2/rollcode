@@ -1841,6 +1841,63 @@ description: base skill
     throw new Error("runtime did not complete in parallel helper circuit test");
   });
 
+  test("supports supervisor visibility and operator-profile memory commands", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rollcode-runtime-"));
+    dirs.push(root);
+    process.env.ROLLCODE_HOME = join(root, ".rollcode-home");
+    process.env.ROLLCODE_CODEX_SKILLS_MIRROR_DIR = join(
+      root,
+      ".codex-skills-rollcode",
+    );
+    const store = new StateStore(join(root, "state.json"));
+    const service = new RollcodeService(
+      store,
+      new FakeCodex() as unknown as CodexAppServerClient,
+    );
+
+    const controller = await service.startInteractiveRun(
+      "Complete task and keep user preferences durable.",
+      root,
+    );
+    await controller.start();
+
+    for (let index = 0; index < 100; index += 1) {
+      const snapshot = controller.getSnapshot();
+      if (snapshot.run.status === "completed") {
+        break;
+      }
+      await Bun.sleep(25);
+    }
+
+    expect(controller.getSnapshot().run.status).toBe("completed");
+
+    await controller.handleCommand("/supervisor status");
+    expect(controller.getSnapshot().logs.at(-1)).toContain(
+      "Supervisor details are OFF.",
+    );
+
+    await controller.handleCommand("/supervisor on");
+    expect(controller.getSnapshot().showSupervisor).toBeTrue();
+    expect(controller.getSnapshot().logs.at(-1)).toContain(
+      "Supervisor details enabled.",
+    );
+
+    await controller.handleCommand(
+      "/memory remember Always prefer minimal diffs and concrete commands.",
+    );
+    expect(controller.getSnapshot().logs.at(-1)).toContain(
+      "Remembered operator preference:",
+    );
+
+    await controller.handleCommand("/memory profile");
+    expect(controller.getSnapshot().logs.at(-1)).toContain(
+      "Always prefer minimal diffs and concrete commands",
+    );
+
+    await controller.dispose();
+    await service.dispose();
+  });
+
   test("records plan-missing event when worker lanes emit no plan state", async () => {
     const root = mkdtempSync(join(tmpdir(), "rollcode-runtime-"));
     dirs.push(root);

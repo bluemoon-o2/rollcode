@@ -10,6 +10,7 @@ import { colors } from "./colors";
 import { FlowingRoleLabel } from "./FlowingRoleLabel";
 import { expandToolsHint } from "./keybindingHints";
 import { Text } from "./Text";
+import { useAnimationTick } from "./useAnimationTick";
 
 const EVENT_PREFIX_PATTERN =
   /^(\d{2}:\d{2}:\d{2}) \[(worker|supervisor|system)\] ?(.*)$/;
@@ -97,6 +98,16 @@ function renderRole(props: {
   return <Text color={colors.event.system}>system</Text>;
 }
 
+function getRoleColor(role: ThreadRole | "system"): string {
+  if (role === "worker") {
+    return colors.event.worker;
+  }
+  if (role === "supervisor") {
+    return colors.event.supervisor;
+  }
+  return colors.event.system;
+}
+
 export const EventStreamLine = memo(
   ({
   line,
@@ -126,60 +137,73 @@ export const EventStreamLine = memo(
       animate &&
       (role === "worker" || role === "supervisor") &&
       activeThreadRole === role;
+    const roleColor = getRoleColor(role);
     const bodyCollapsed =
       !expanded && shouldCollapseOutput(body, maxPreviewChars, maxPreviewLines);
+    const frameTick = useAnimationTick(showActiveDot);
+    const railFrames = ["▏", "▎", "▍", "▎"] as const;
+    const railSymbol = showActiveDot
+      ? railFrames[frameTick % railFrames.length] ?? "▎"
+      : "▏";
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row">
+        <Box flexDirection="row" flexWrap="wrap">
           <Box width={2} flexShrink={0}>
             {showActiveDot ? (
               <BlinkDot
-                color={
-                  role === "worker"
-                    ? colors.event.worker
-                    : role === "supervisor"
-                      ? colors.event.supervisor
-                      : colors.event.system
-                }
+                color={roleColor}
                 shouldAnimate={animate}
               />
             ) : (
-              <Text
-                color={
-                  role === "worker"
-                    ? colors.event.worker
-                    : role === "supervisor"
-                      ? colors.event.supervisor
-                      : colors.event.system
-                }
-              >
-                ●
+              <Text color={roleColor}>
+                ▌
               </Text>
             )}
           </Box>
+          <Text color={colors.event.hint} dimColor>
+            event
+          </Text>
+          <Text> </Text>
+          <Text color={colors.event.bracket}>[</Text>
           {parsedFirst ? (
-            <>
-              <Text color={colors.event.timestamp}>{parsedFirst.stamp} </Text>
-              <Text color={colors.event.bracket}>[</Text>
-              {renderRole({
-                role: parsedFirst.role,
-                activeThreadRole,
-                animate,
-              })}
-              <Text color={colors.event.bracket}>]</Text>
-            </>
+            renderRole({
+              role: parsedFirst.role,
+              activeThreadRole,
+              animate,
+            })
           ) : (
             <Text color={colors.event.system}>system</Text>
           )}
+          <Text color={colors.event.bracket}>]</Text>
+          {parsedFirst ? (
+            <>
+              <Text color={colors.event.hint} dimColor>
+                {" "}
+                ·{" "}
+              </Text>
+              <Text color={colors.event.timestamp}>{parsedFirst.stamp}</Text>
+            </>
+          ) : null}
         </Box>
         {body ? (
-          <CollapsedOutputDisplay
-            output={body}
-            maxLines={expanded ? Infinity : maxPreviewLines}
-            maxChars={expanded ? undefined : maxPreviewChars}
-            hintText={bodyCollapsed ? expandToolsHint("expand") : undefined}
-          />
+          <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              <Text color={roleColor} dimColor>
+                {railSymbol}
+              </Text>
+            </Box>
+            <Box flexGrow={1}>
+              <CollapsedOutputDisplay
+                output={body}
+                maxLines={expanded ? Infinity : maxPreviewLines}
+                maxChars={expanded ? undefined : maxPreviewChars}
+                hintText={bodyCollapsed ? expandToolsHint("expand") : undefined}
+                firstLinePrefix=""
+                restLinePrefix=""
+              />
+            </Box>
+          </Box>
         ) : null}
       </Box>
     );

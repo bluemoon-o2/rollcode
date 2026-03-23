@@ -31,6 +31,7 @@ import { AnimationProvider } from "./contexts/AnimationContext";
 import {
   EXPAND_TOOLS_KEY,
   expandToolsHint,
+  formatKeyHint,
   formatKeyForDisplay,
 } from "./components/keybindingHints";
 import { InfoOverlay } from "./components/InfoOverlay";
@@ -41,6 +42,7 @@ import { UserMessage } from "./components/UserMessage";
 import { WorkerHandoffMessage } from "./components/WorkerHandoffMessage";
 import {
   parseCommandOutput,
+  summarizeCommandEntries,
 } from "./commandOutputParser";
 import {
   buildChangelogMarkdown,
@@ -63,8 +65,11 @@ const MIN_EVENT_STREAM_LINES = 6;
 const RESIZE_SETTLE_DELAY_MS = 220;
 const ANIMATION_RESUME_HYSTERESIS_ROWS = 2;
 const CTRL_SHORTCUT_TOGGLE_DEDUPE_MS = 120;
+const DENSITY_TOGGLE_KEY = "ctrl+u";
+type ConversationDensity = "immersive" | "compact";
 const CTRL_SHORTCUT_CHAR_MAP = {
   o: "\u000f",
+  u: "\u0015",
 } as const;
 
 function matchesCtrlShortcut(
@@ -241,6 +246,89 @@ function summarizeDiff(diff: string): string {
   return `+${added} / -${removed} lines`;
 }
 
+function sanitizeSingleLine(value: string): string {
+  return value
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateSingleLine(value: string, maxWidth: number): string {
+  const normalized = sanitizeSingleLine(value);
+  if (maxWidth <= 0) {
+    return "";
+  }
+  if (normalized.length <= maxWidth) {
+    return normalized;
+  }
+  if (maxWidth <= 1) {
+    return normalized.slice(0, 1);
+  }
+  return `${normalized.slice(0, maxWidth - 1)}…`;
+}
+
+function formatCompactCount(value: number): string {
+  if (value < 1000) {
+    return String(value);
+  }
+  if (value < 10000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  if (value < 1000000) {
+    return `${Math.round(value / 1000)}k`;
+  }
+  if (value < 10000000) {
+    return `${(value / 1000000).toFixed(1)}M`;
+  }
+  return `${Math.round(value / 1000000)}M`;
+}
+
+function buildTwoColumnFooterLine(options: {
+  width: number;
+  left: string;
+  right: string;
+  minGap?: number;
+}): string {
+  const minGap = Math.max(1, options.minGap ?? 2);
+  const maxWidth = Math.max(1, options.width);
+  let left = sanitizeSingleLine(options.left);
+  let right = sanitizeSingleLine(options.right);
+
+  if (!right) {
+    return truncateSingleLine(left, maxWidth);
+  }
+  if (!left) {
+    return truncateSingleLine(right, maxWidth);
+  }
+
+  if (left.length + minGap + right.length <= maxWidth) {
+    return `${left}${" ".repeat(maxWidth - left.length - right.length)}${right}`;
+  }
+
+  if (right.length >= maxWidth - minGap) {
+    right = truncateSingleLine(right, Math.max(1, maxWidth - minGap));
+    return right;
+  }
+
+  const availableForLeft = maxWidth - right.length - minGap;
+  left = truncateSingleLine(left, Math.max(1, availableForLeft));
+  if (left.length + minGap + right.length <= maxWidth) {
+    return `${left}${" ".repeat(maxWidth - left.length - right.length)}${right}`;
+  }
+  return truncateSingleLine(`${left} ${right}`, maxWidth);
+}
+
+function shortId(value: string, size = 8): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "-";
+  }
+  if (trimmed.length <= size) {
+    return trimmed;
+  }
+  return trimmed.slice(0, size);
+}
+
 function formatCwdForFooter(cwd: string): string {
   const home = process.env.HOME || process.env.USERPROFILE;
   if (home && cwd.startsWith(home)) {
@@ -346,6 +434,32 @@ function estimateCommandMessageLines(options: {
 const EVENT_PREFIX_PATTERN =
   /^(\d{2}:\d{2}:\d{2}) \[(worker|supervisor|system)\] ?(.*)$/;
 
+function classifyTransientEventGroup(
+  role: "worker" | "supervisor" | "system" | null,
+  body: string,
+): string | null {
+  if (role !== "system") {
+    return null;
+  }
+  const normalized = body.trim().toLowerCase();
+  if (
+    normalized.startsWith("transient upstream error during ") &&
+    normalized.includes(" retrying (") &&
+    normalized.includes(" in ") &&
+    normalized.includes("ms")
+  ) {
+    return "system:transient-retry";
+  }
+  if (
+    normalized.includes(
+      "supervisor strict schema rejected by upstream; retrying once with legacy-compatible schema",
+    )
+  ) {
+    return "system:schema-fallback-retry";
+  }
+  return null;
+}
+
 function extractEventBody(line: string): string {
   const normalized = line.replace(/\r/g, "");
   const parts = normalized.split("\n");
@@ -378,6 +492,8 @@ export function App(props: {
   const [isAutocompleteActive, setIsAutocompleteActive] = useState(false);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [logsExpanded, setLogsExpanded] = useState(false);
+  const [conversationDensity, setConversationDensity] =
+    useState<ConversationDensity>("immersive");
   const [overlay, setOverlay] = useState<"codex" | "hotkeys" | "changelog" | null>(
     null,
   );
@@ -389,6 +505,7 @@ export function App(props: {
   const inputRef = useRef(input);
   const autocompleteActiveRef = useRef(isAutocompleteActive);
   const lastExpandShortcutAtRef = useRef(0);
+  const lastDensityShortcutAtRef = useRef(0);
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -534,6 +651,27 @@ export function App(props: {
         setLogsExpanded((value) => !value);
         return;
       }
+      const isCtrlUPlain = isRawCtrlShortcut(typedInput, "u");
+      const isCtrlUModified = matchesCtrlShortcut(typedInput, key.ctrl, "u");
+      if (isCtrlUPlain || isCtrlUModified) {
+        const now = Date.now();
+        if (
+          now - lastDensityShortcutAtRef.current <
+          CTRL_SHORTCUT_TOGGLE_DEDUPE_MS
+        ) {
+          return;
+        }
+        lastDensityShortcutAtRef.current = now;
+        setConversationDensity((value) =>
+          value === "immersive" ? "compact" : "immersive",
+        );
+        setNotice(
+          conversationDensity === "immersive"
+            ? "View density: compact"
+            : "View density: immersive",
+        );
+        return;
+      }
       if (isEscape) {
         void interruptActiveTurn();
         return;
@@ -563,7 +701,7 @@ export function App(props: {
         }
       }
     },
-    [exit, interruptActiveTurn, onExitRequest, overlay],
+    [conversationDensity, exit, interruptActiveTurn, onExitRequest, overlay],
   );
 
   useInput(handleGlobalInput);
@@ -688,6 +826,12 @@ export function App(props: {
 
   const terminalColumns = Math.max(40, stdout?.columns ?? 80);
   const terminalRows = Math.max(20, stdout?.rows ?? 40);
+  const compactTimeline = conversationDensity === "compact";
+  const sectionGap = compactTimeline ? 0 : 1;
+  const minimizeTopChrome =
+    snapshot.run.status === "completed" &&
+    snapshot.activeThreadRole === null &&
+    !logsExpanded;
   const horizontalLine = useMemo(
     () => buildHorizontalLine(terminalColumns, "─"),
     [terminalColumns],
@@ -706,18 +850,70 @@ export function App(props: {
           : colors.progress.phaseFlow;
   const eventWindowCap = Math.max(
     MIN_EVENT_STREAM_LINES,
-    terminalRows - 18,
+    terminalRows - (compactTimeline ? 15 : 18),
   );
   const eventWindowSize = Math.min(EVENT_STREAM_MAX_LINES, eventWindowCap);
   const eventLines = snapshot.logs.slice(-eventWindowSize);
   const keyedEventLines = useMemo(() => {
-    const occurrences = new Map<string, number>();
-    return eventLines.map((line) => {
-      const next = (occurrences.get(line) ?? 0) + 1;
-      occurrences.set(line, next);
+    const grouped: Array<{
+      key: string;
+      count: number;
+      role: "worker" | "supervisor" | "system" | null;
+      stamp: string;
+      body: string;
+      raw: string;
+    }> = [];
+    for (const line of eventLines) {
+      const normalized = line.replace(/\r/g, "");
+      const segments = normalized.split("\n");
+      const first = segments[0] ?? "";
+      const rest = segments.slice(1);
+      const parsed = EVENT_PREFIX_PATTERN.exec(first);
+      const role = parsed
+        ? (parsed[2] as "worker" | "supervisor" | "system")
+        : null;
+      const stamp = parsed ? parsed[1] ?? "" : "";
+      const body = parsed ? [parsed[3] ?? "", ...rest].join("\n") : normalized;
+      const transientGroup = classifyTransientEventGroup(role, body);
+      const key = transientGroup ?? (role ? `${role}|${body}` : `raw|${normalized}`);
+
+      const previous = grouped[grouped.length - 1];
+      if (previous && previous.key === key) {
+        previous.count += 1;
+        if (stamp) {
+          previous.stamp = stamp;
+        }
+        previous.body = body;
+        previous.raw = normalized;
+        continue;
+      }
+      grouped.push({
+        key,
+        count: 1,
+        role,
+        stamp,
+        body,
+        raw: normalized,
+      });
+    }
+    return grouped.map((entry, index) => {
+      if (!entry.role) {
+        return {
+          line: entry.count > 1 ? `${entry.raw} (x${entry.count})` : entry.raw,
+          key: `${entry.key}#${index + 1}`,
+        };
+      }
+      const bodyLines = entry.body.split("\n");
+      const firstBody = bodyLines[0] ?? "";
+      const firstWithCount =
+        entry.count > 1 ? `${firstBody} (x${entry.count})` : firstBody;
+      const rebuilt = [
+        `${entry.stamp} [${entry.role}] ${firstWithCount}`,
+        ...bodyLines.slice(1),
+      ].join("\n");
       return {
-        line,
-        key: `${line}#${next}`,
+        line: rebuilt,
+        key: `${entry.key}#${index + 1}`,
       };
     });
   }, [eventLines]);
@@ -750,8 +946,8 @@ export function App(props: {
     snapshot.activeThreadRole === "worker" &&
     (snapshot.run.status === "working" || snapshot.run.status === "repairing");
   const diffPreviewLineBudget = Math.max(
-    4,
-    Math.min(DIFF_PREVIEW_COLLAPSED_LINES, terminalRows - 24),
+    compactTimeline ? 3 : 4,
+    Math.min(DIFF_PREVIEW_COLLAPSED_LINES, terminalRows - (compactTimeline ? 20 : 24)),
   );
   const hasCollapsedSupervisor =
     supervisorOutput.length > 0 &&
@@ -793,9 +989,34 @@ export function App(props: {
     hasCollapsedDiff ||
     hasCollapsedCommandOutput ||
     hasCollapsedEventLine;
-  const sessionMenuHint = `${formatKeyForDisplay(EXPAND_TOOLS_KEY)} expand tools · esc interrupt · /supervisor · /hotkeys · /changelog`;
-  const footerPath = formatCwdForFooter(snapshot.agent.cwd);
-  const footerStats = `turns ${snapshot.run.workerTurnCount} · status ${snapshot.run.status} · events ${snapshot.logs.length}`;
+  const sessionMenuHintPrimary = [
+    formatKeyHint(EXPAND_TOOLS_KEY, logsExpanded ? "collapse tools" : "expand tools"),
+    formatKeyHint(
+      DENSITY_TOGGLE_KEY,
+      compactTimeline ? "immersive view" : "compact view",
+    ),
+    formatKeyHint("esc", "interrupt"),
+    formatKeyHint("tab", "autocomplete"),
+  ].join(" · ");
+  const sessionMenuHintSecondary =
+    "/supervisor on|off · /memory profile · /hotkeys · /changelog";
+  const commandSummary = summarizeCommandEntries(commandEntries);
+  const footerPath = buildTwoColumnFooterLine({
+    width: Math.max(1, terminalColumns - 1),
+    left: formatCwdForFooter(snapshot.agent.cwd),
+    right: `agent ${shortId(snapshot.agent.id)} · run ${shortId(snapshot.run.id)}`,
+  });
+  const footerStats = buildTwoColumnFooterLine({
+    width: Math.max(1, terminalColumns - 1),
+    left:
+      `turns ${formatCompactCount(snapshot.run.workerTurnCount)} · ` +
+      `events ${formatCompactCount(snapshot.logs.length)} · ` +
+      `${commandSummary}`,
+    right:
+      `${snapshot.activeThreadRole ? `lane ${snapshot.activeThreadRole}` : snapshot.run.status} · ` +
+      `${snapshot.showSupervisor ? "supervisor on" : "supervisor off"} · ` +
+      `view ${conversationDensity}`,
+  });
   const slashPlaceholder = "Describe what you want to do...";
   const visibleSlashRows = Math.max(8, Math.min(16, terminalRows - 22));
   const slashAutocompleteState = useMemo(
@@ -926,51 +1147,58 @@ export function App(props: {
   return (
     <AnimationProvider shouldAnimate={shouldAnimate}>
       <Box flexDirection="column">
-        <Box flexDirection="row">
-        <Box width={2} flexShrink={0}>
-          {runAnimating ? (
-            <BlinkDot
-              color={colors.progress.spinner}
-              shouldAnimate={shouldAnimate}
+        {!minimizeTopChrome ? (
+          <>
+            <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              {runAnimating ? (
+                <BlinkDot
+                  color={colors.progress.spinner}
+                  shouldAnimate={shouldAnimate}
+                />
+              ) : (
+                <Text color={runStatusColor}>
+                  {getRunStatusSymbol(snapshot.run.status)}
+                </Text>
+              )}
+            </Box>
+            <FlowingRoleLabel
+              text={statusLineLabel}
+              staticColor={runStatusColor}
+              palette={statusLabelPalette}
+              animate={shouldAnimateStatusLabel}
             />
-          ) : (
-            <Text color={runStatusColor}>
-              {getRunStatusSymbol(snapshot.run.status)}
+            <Text color={colors.event.hint} dimColor>
+              {logsExpanded
+                ? ` (${expandToolsHint("collapse")})`
+                : hasCollapsedConversationInfo
+                  ? ` (${expandToolsHint("expand")})`
+                : ` (${formatKeyForDisplay(EXPAND_TOOLS_KEY)})`}
             </Text>
-          )}
-        </Box>
-        <FlowingRoleLabel
-          text={statusLineLabel}
-          staticColor={runStatusColor}
-          palette={statusLabelPalette}
-          animate={shouldAnimateStatusLabel}
-        />
-        <Text color={colors.event.hint} dimColor>
-          {logsExpanded
-            ? ` (${expandToolsHint("collapse")})`
-            : hasCollapsedConversationInfo
-              ? ` (${expandToolsHint("expand")})`
-            : ` (${formatKeyForDisplay(EXPAND_TOOLS_KEY)})`}
-        </Text>
-        </Box>
-        <Box marginLeft={2}>
-        <Text color={colors.event.hint} dimColor>
-          {sessionMenuHint}
-        </Text>
-        </Box>
+            </Box>
+            <Box marginLeft={2} flexDirection="column">
+            <Text color={colors.event.hint} dimColor wrap="truncate-end">
+              {sessionMenuHintPrimary}
+            </Text>
+            <Text color={colors.event.hint} dimColor wrap="truncate-end">
+              {sessionMenuHintSecondary}
+            </Text>
+            </Box>
 
-        <Box marginTop={1}>
-        <UserMessage
-          line={{
-            kind: "user",
-            id: `goal-${snapshot.run.id}`,
-            text: snapshot.run.goal,
-          }}
-          expanded={logsExpanded}
-          maxPreviewChars={eventPreviewChars}
-          maxPreviewLines={3}
-        />
-        </Box>
+            <Box marginTop={sectionGap}>
+            <UserMessage
+              line={{
+                kind: "user",
+                id: `goal-${snapshot.run.id}`,
+                text: snapshot.run.goal,
+              }}
+              expanded={logsExpanded}
+              maxPreviewChars={eventPreviewChars}
+              maxPreviewLines={3}
+            />
+            </Box>
+          </>
+        ) : null}
 
         {notice ? (
           <Box marginTop={1}>
@@ -983,7 +1211,7 @@ export function App(props: {
         if (entry.threadRole === "worker") {
           const payload = entry.payload as WorkerTurnOutput;
           return (
-            <Box key={`worker-${historyKey}`} marginTop={1} flexDirection="column">
+            <Box key={`worker-${historyKey}`} marginTop={sectionGap} flexDirection="column">
               <AssistantMessage
                 line={{
                   kind: "assistant",
@@ -995,7 +1223,7 @@ export function App(props: {
                 maxPreviewChars={eventPreviewChars}
                 maxPreviewLines={diffPreviewLineBudget}
               />
-              <Box marginTop={1}>
+              <Box marginTop={sectionGap}>
                 <WorkerHandoffMessage
                   handoff={payload.handoff}
                   expanded={logsExpanded}
@@ -1014,7 +1242,7 @@ export function App(props: {
           return null;
         }
         return (
-          <Box key={`supervisor-${historyKey}`} marginTop={1}>
+          <Box key={`supervisor-${historyKey}`} marginTop={sectionGap}>
             <ExpandableDetailsMessage
               label="supervisor"
               summary={summarizeSupervisorDecision(
@@ -1029,7 +1257,7 @@ export function App(props: {
         })}
 
         {showStreamingAssistant ? (
-          <Box marginTop={1}>
+          <Box marginTop={sectionGap}>
             <AssistantMessage
               line={{
                 kind: "assistant",
@@ -1043,7 +1271,7 @@ export function App(props: {
         ) : null}
 
         {planOutput ? (
-          <Box marginTop={1}>
+          <Box marginTop={sectionGap}>
             <ExpandableDetailsMessage
               label="plan"
               summary={summarizePlan(snapshot.plan)}
@@ -1054,7 +1282,7 @@ export function App(props: {
         ) : null}
 
         {snapshot.diff ? (
-          <Box marginTop={1}>
+          <Box marginTop={sectionGap}>
             <ExpandableDetailsMessage
               label="diff"
               summary={summarizeDiff(snapshot.diff)}
@@ -1066,7 +1294,7 @@ export function App(props: {
 
         <Box flexDirection="column">
           {keyedEventLines.map((entry) => (
-            <Box key={entry.key} marginTop={1}>
+            <Box key={entry.key} marginTop={sectionGap}>
               <EventStreamLine
                 line={entry.line}
                 expanded={logsExpanded}
@@ -1079,7 +1307,7 @@ export function App(props: {
           {logsExpanded && commandEntries.length > 0 ? (
             <>
               {commandEntries.map((entry) => (
-                <Box key={entry.id} marginTop={1}>
+                <Box key={entry.id} marginTop={sectionGap}>
                   <CommandMessage
                     line={{
                       kind: "command",
@@ -1099,6 +1327,24 @@ export function App(props: {
                 </Box>
               ))}
             </>
+          ) : null}
+          {minimizeTopChrome ? (
+            <Box marginTop={sectionGap}>
+              <Box flexDirection="row" flexWrap="wrap">
+                <Box width={2} flexShrink={0}>
+                  <Text color={runStatusColor}>
+                    {getRunStatusSymbol(snapshot.run.status)}
+                  </Text>
+                </Box>
+                <Text color={colors.event.hint} dimColor>
+                  status
+                </Text>
+                <Text> </Text>
+                <Text color={colors.event.bracket}>[</Text>
+                <Text color={runStatusColor}>{statusLineLabel}</Text>
+                <Text color={colors.event.bracket}>]</Text>
+              </Box>
+            </Box>
           ) : null}
         </Box>
 

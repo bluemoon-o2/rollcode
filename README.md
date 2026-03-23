@@ -122,9 +122,9 @@ Notes:
 
 Common slash commands during a run:
 
-- `/supervisor` toggle supervisor details
+- `/supervisor [on|off|status]` toggle or inspect supervisor details
 - `/resume` continue autonomous progress
-- `/memory` print current memory status
+- `/memory [status|profile|remember <text>]` inspect memory, view operator profile, or store a durable preference
 - `/skills` list resolved skills for this run
 - `/skills reload` manually reload the skill catalog for the active run
 - `/doctor` run runtime health checks
@@ -153,6 +153,15 @@ rollcode memory log
 
 Memory files are markdown with frontmatter (`description`, `limit`, etc.), and updates are committed so you can audit learning over time.
 During turns, RollCode adds task-scoped memory recall from non-system files, and each file's `limit` bounds how much content can be injected into prompts.
+Default memory layout is:
+
+- `system/identity.md`: agent identity and operating rules
+- `system/project-context.md`: durable project context
+- `system/operator-profile.md`: Letta-style durable operator preference profile
+- `project/*`: on-demand project notes
+- `episodes/*`: run-level episodic summaries
+
+When operators send steering messages, RollCode can capture durable preference signals into `system/operator-profile.md` (deduplicated, timestamped) so future runs inherit personalization.
 
 ## Skills Resolution
 

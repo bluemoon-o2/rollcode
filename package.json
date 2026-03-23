@@ -1,9 +1,12 @@
 {
   "name": "@bluemoon-o2/rollcode",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "RollCode is a persistent code agent.",
   "type": "module",
-  "keywords": ["cli", "code-agent"],
+  "keywords": [
+    "cli",
+    "code-agent"
+  ],
   "bin": {
     "rollcode": "rollcode.js"
   },

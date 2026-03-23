@@ -20,6 +20,11 @@ import { parseFrontmatter, stringifyFrontmatter } from "./frontmatter";
 const DEFAULT_LIMIT = 4000;
 const DEFAULT_RECALL_RESULTS = 4;
 const RECALL_SNIPPET_SOFT_LIMIT = 720;
+const DEFAULT_OPERATOR_PROFILE_LIMIT = 2400;
+const OPERATOR_PROFILE_RELATIVE_PATH = "system/operator-profile.md";
+const LEARNED_PREFERENCES_HEADING = "## Learned Preferences";
+const OPERATOR_PREFERENCE_HINT_PATTERN =
+  /(?:\b(?:always|never|prefer|preference|default|avoid|must|should|instead|keep|use|without)\b|请|不要|别|优先|偏好|习惯|默认|记住|以后|长期|必须|务必|尽量|避免)/i;
 const RECALL_STOP_WORDS = new Set([
   "the",
   "and",
@@ -251,6 +256,104 @@ function applyMemoryLimit(text: string, limit: number): string {
   return `${normalized.slice(0, safeLimit)}\n...[truncated by memory limit ${safeLimit}]`;
 }
 
+function normalizePreferenceText(input: string): string {
+  return input
+    .replace(/\s+/g, " ")
+    .replace(/^[\-*#\d.():：\s]+/, "")
+    .replace(/[。；;，,\s]+$/g, "")
+    .trim();
+}
+
+function canonicalizePreference(input: string): string {
+  return normalizePreferenceText(
+    input
+      .replace(/^\[[^\]]+\]\s*/, "")
+      .replace(/\(source:[^)]+\)\s*$/i, ""),
+  )
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractOperatorPreferenceCandidates(message: string): string[] {
+  if (!message.trim()) {
+    return [];
+  }
+
+  const candidates = message
+    .split(/[\r\n]+|[。！？!?；;]+/g)
+    .map((segment) => normalizePreferenceText(segment))
+    .filter((segment) => segment.length >= 8 && segment.length <= 220)
+    .filter((segment) => OPERATOR_PREFERENCE_HINT_PATTERN.test(segment));
+
+  const seen = new Set<string>();
+  const selected: string[] = [];
+  for (const candidate of candidates) {
+    const canonical = canonicalizePreference(candidate);
+    if (!canonical || seen.has(canonical)) {
+      continue;
+    }
+    seen.add(canonical);
+    selected.push(candidate);
+    if (selected.length >= 4) {
+      break;
+    }
+  }
+  return selected;
+}
+
+function collectExistingPreferenceKeys(body: string): Set<string> {
+  const keys = new Set<string>();
+  for (const line of body.split(/\r?\n/)) {
+    const match = /^\s*-\s+(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const key = canonicalizePreference(match[1] ?? "");
+    if (key) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+function injectLearnedPreferences(body: string, bullets: string[]): string {
+  const normalized = body.trimEnd();
+  if (!normalized) {
+    return `${LEARNED_PREFERENCES_HEADING}\n\n${bullets.join("\n")}\n`;
+  }
+
+  const lines = normalized.split("\n");
+  const headingIndex = lines.findIndex(
+    (line) => line.trim() === LEARNED_PREFERENCES_HEADING,
+  );
+  if (headingIndex === -1) {
+    return `${normalized}\n\n${LEARNED_PREFERENCES_HEADING}\n\n${bullets.join("\n")}\n`;
+  }
+
+  let sectionEnd = lines.length;
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    if (lines[index]?.startsWith("## ")) {
+      sectionEnd = index;
+      break;
+    }
+  }
+
+  const before = lines.slice(0, headingIndex + 1).join("\n");
+  const after = lines.slice(sectionEnd).join("\n");
+  const existingSection = lines
+    .slice(headingIndex + 1, sectionEnd)
+    .filter((line) => line.trim() !== "- (none yet)")
+    .join("\n")
+    .trim();
+  const mergedSection = existingSection
+    ? `${bullets.join("\n")}\n${existingSection}`
+    : bullets.join("\n");
+  const afterBlock = after.trim() ? `\n\n${after.trimStart()}` : "";
+  return `${before}\n\n${mergedSection}${afterBlock}\n`;
+}
+
 export class MemoryManager {
   readonly agentId: string;
   readonly memoryDir: string;
@@ -295,6 +398,25 @@ export class MemoryManager {
 - Repository root: ${cwd}
 - RollCode project root: ${getProjectRoot()}
 - Update this file only with durable conventions, architecture, or user preferences.
+      `.trim(),
+    );
+
+    await this.ensureFile(
+      join(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH),
+      {
+        description:
+          "Pinned operator preferences and collaboration style (Letta-style human profile).",
+        limit: DEFAULT_OPERATOR_PROFILE_LIMIT,
+      },
+      `
+# Operator Profile
+
+- Keep this file focused on durable operator preferences, not one-off task chatter.
+- Prefer concise bullets that can guide behavior in future runs.
+
+## Learned Preferences
+
+- (none yet)
       `.trim(),
     );
 
@@ -488,12 +610,115 @@ ${handoff.unresolved.map((item) => `- ${item}`).join("\n") || "- None."}
     ].join("\n");
   }
 
+  async operatorProfile(): Promise<string> {
+    const profilePath = join(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH);
+    if (!(await pathExists(profilePath))) {
+      return "Operator profile is not initialized yet.";
+    }
+    const profile = parseFrontmatter(await readFile(profilePath, "utf8"));
+    return [
+      `Operator profile: ${profilePath}`,
+      "",
+      applyMemoryLimit(profile.body, profile.attributes.limit),
+    ].join("\n");
+  }
+
+  async rememberOperatorPreference(
+    preference: string,
+    source = "manual",
+  ): Promise<string | null> {
+    const normalized = normalizePreferenceText(preference);
+    if (!normalized) {
+      return null;
+    }
+    const added = await this.appendOperatorPreferences([normalized], source);
+    if (added.length === 0) {
+      return null;
+    }
+    return `Remembered operator preference: ${added.join(" | ")}`;
+  }
+
+  async captureOperatorPreferencesFromMessage(
+    message: string,
+    source = "operator-message",
+  ): Promise<string | null> {
+    const candidates = extractOperatorPreferenceCandidates(message);
+    if (candidates.length === 0) {
+      return null;
+    }
+    const added = await this.appendOperatorPreferences(candidates, source);
+    if (added.length === 0) {
+      return null;
+    }
+    return `Captured operator preferences: ${added.join(" | ")}`;
+  }
+
   diff(): string {
     return this.runGit(["diff", "--no-ext-diff"], true);
   }
 
   log(): string {
     return this.runGit(["log", "--oneline", "-n", "20"], true);
+  }
+
+  private async appendOperatorPreferences(
+    preferences: string[],
+    source: string,
+  ): Promise<string[]> {
+    if (preferences.length === 0) {
+      return [];
+    }
+
+    const profilePath = join(this.memoryDir, OPERATOR_PROFILE_RELATIVE_PATH);
+    if (!(await pathExists(profilePath))) {
+      return [];
+    }
+
+    const existing = parseFrontmatter(await readFile(profilePath, "utf8"));
+    const existingKeys = collectExistingPreferenceKeys(existing.body);
+    const added: string[] = [];
+
+    for (const preference of preferences) {
+      const normalized = normalizePreferenceText(preference);
+      if (!normalized) {
+        continue;
+      }
+      const key = canonicalizePreference(normalized);
+      if (!key || existingKeys.has(key)) {
+        continue;
+      }
+      existingKeys.add(key);
+      added.push(normalized);
+    }
+
+    if (added.length === 0) {
+      return [];
+    }
+
+    const stamp = todayStamp();
+    const sourceLabel = normalizePreferenceText(source) || "manual";
+    const bullets = added.map(
+      (item) => `- [${stamp}] ${item} (source: ${sourceLabel})`,
+    );
+    const nextBody = injectLearnedPreferences(existing.body, bullets);
+    await writeText(
+      profilePath,
+      stringifyFrontmatter({
+        attributes: {
+          ...existing.attributes,
+          updatedAt: nowIso(),
+        },
+        body: nextBody,
+      }),
+    );
+
+    this.runGit(["add", OPERATOR_PROFILE_RELATIVE_PATH]);
+    const status = this.runGit(["status", "--porcelain"], true).trim();
+    if (status) {
+      this.runGit(["commit", "-m", "memory: update operator profile"], true);
+    }
+
+    return added;
   }
 
   private async ensureFile(

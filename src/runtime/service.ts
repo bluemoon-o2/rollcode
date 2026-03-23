@@ -119,6 +119,17 @@ type SnapshotListener = (snapshot: RunSnapshot) => void;
 
 const INTERRUPTED_GUIDANCE_MESSAGE =
   "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report issues.";
+const SUPERVISOR_COMMAND_USAGE = "Usage: /supervisor [on|off|status]";
+const MEMORY_COMMAND_USAGE =
+  "Usage: /memory [status|profile|remember <preference>]";
+
+type SupervisorVisibilityCommand = "toggle" | "on" | "off" | "status";
+
+type SessionMemoryCommand =
+  | { kind: "status" }
+  | { kind: "profile" }
+  | { kind: "remember"; preference: string }
+  | { kind: "invalid"; hint: string };
 
 function isTransientHttpError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -145,6 +156,100 @@ function normalizeSupervisorDecision(
         ? decision.nextInstruction
         : "",
   };
+}
+
+function parseSupervisorVisibilityCommand(
+  input: string,
+): SupervisorVisibilityCommand | null {
+  const trimmed = input.trim();
+  if (trimmed === "/supervisor") {
+    return "toggle";
+  }
+  const match = /^\/supervisor(?:\s+([a-zA-Z]+))$/.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const mode = (match[1] ?? "").toLowerCase();
+  if (mode === "on" || mode === "off" || mode === "status") {
+    return mode;
+  }
+  return null;
+}
+
+function applySupervisorVisibilityCommand(
+  current: boolean,
+  command: SupervisorVisibilityCommand,
+): boolean {
+  if (command === "status") {
+    return current;
+  }
+  if (command === "on") {
+    return true;
+  }
+  if (command === "off") {
+    return false;
+  }
+  return !current;
+}
+
+function formatSupervisorVisibilityMessage(
+  visible: boolean,
+  hasHistory: boolean,
+  command: SupervisorVisibilityCommand,
+): string {
+  if (command === "status") {
+    return visible
+      ? "Supervisor details are ON."
+      : "Supervisor details are OFF.";
+  }
+  if (visible) {
+    return hasHistory
+      ? "Supervisor details enabled."
+      : "Supervisor details enabled (no supervisor decisions recorded yet).";
+  }
+  return "Supervisor details hidden.";
+}
+
+function parseSessionMemoryCommand(input: string): SessionMemoryCommand | null {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/memory")) {
+    return null;
+  }
+
+  const head = trimmed.split(/\s+/)[0];
+  if (head !== "/memory") {
+    return null;
+  }
+
+  if (trimmed === "/memory") {
+    return { kind: "status" };
+  }
+
+  if (/^\/memory\s+status$/i.test(trimmed)) {
+    return { kind: "status" };
+  }
+
+  if (/^\/memory\s+profile$/i.test(trimmed)) {
+    return { kind: "profile" };
+  }
+
+  const rememberMatch = /^\/memory\s+remember\s+([\s\S]+)$/i.exec(trimmed);
+  if (rememberMatch) {
+    const preference = (rememberMatch[1] ?? "").trim();
+    if (!preference) {
+      return { kind: "invalid", hint: MEMORY_COMMAND_USAGE };
+    }
+    return { kind: "remember", preference };
+  }
+
+  if (/^\/memory\s+remember$/i.test(trimmed)) {
+    return {
+      kind: "invalid",
+      hint: "Usage: /memory remember <preference>",
+    };
+  }
+
+  return { kind: "invalid", hint: MEMORY_COMMAND_USAGE };
 }
 
 export interface SessionController {
@@ -315,6 +420,75 @@ class DetachedRunWatcher implements SessionController {
       return;
     }
 
+    const supervisorCommand = parseSupervisorVisibilityCommand(trimmed);
+    if (supervisorCommand) {
+      const nextVisible = applySupervisorVisibilityCommand(
+        this.snapshot.showSupervisor,
+        supervisorCommand,
+      );
+      const hasHistory =
+        Boolean(this.snapshot.latestSupervisorDecision) ||
+        this.snapshot.turnHistory.some(
+          (entry) => entry.threadRole === "supervisor",
+        );
+      this.publishSnapshot({
+        ...this.snapshot,
+        showSupervisor: nextVisible,
+        logs: [
+          ...this.snapshot.logs,
+          formatSupervisorVisibilityMessage(
+            nextVisible,
+            hasHistory,
+            supervisorCommand,
+          ),
+        ],
+      });
+      return;
+    }
+    if (trimmed.startsWith("/supervisor")) {
+      this.publishSnapshot({
+        ...this.snapshot,
+        logs: [...this.snapshot.logs, SUPERVISOR_COMMAND_USAGE],
+      });
+      return;
+    }
+
+    const memoryCommand = parseSessionMemoryCommand(trimmed);
+    if (memoryCommand) {
+      const memory = new MemoryManager(this.agent.id);
+      if (memoryCommand.kind === "status") {
+        const status = await memory.status();
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [...this.snapshot.logs, status],
+        });
+        return;
+      }
+      if (memoryCommand.kind === "profile") {
+        const profile = await memory.operatorProfile();
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [...this.snapshot.logs, profile],
+        });
+        return;
+      }
+      if (memoryCommand.kind === "remember") {
+        this.publishSnapshot({
+          ...this.snapshot,
+          logs: [
+            ...this.snapshot.logs,
+            "Attach mode is read-only. Use owner session for /memory remember.",
+          ],
+        });
+        return;
+      }
+      this.publishSnapshot({
+        ...this.snapshot,
+        logs: [...this.snapshot.logs, memoryCommand.hint],
+      });
+      return;
+    }
+
     switch (trimmed) {
       case "/new":
         this.publishSnapshot({
@@ -325,21 +499,6 @@ class DetachedRunWatcher implements SessionController {
           ],
         });
         return;
-      case "/supervisor":
-        this.publishSnapshot({
-          ...this.snapshot,
-          showSupervisor: !this.snapshot.showSupervisor,
-        });
-        return;
-      case "/memory": {
-        const memory = new MemoryManager(this.agent.id);
-        const status = await memory.status();
-        this.publishSnapshot({
-          ...this.snapshot,
-          logs: [...this.snapshot.logs, status],
-        });
-        return;
-      }
       case "/skills": {
         const discovery = await discoverSkillsDetailed(
           this.agent.cwd,
@@ -609,13 +768,59 @@ class RunRuntime implements SessionController {
       return;
     }
 
+    const supervisorCommand = parseSupervisorVisibilityCommand(trimmed);
+    if (supervisorCommand) {
+      this.showSupervisor = applySupervisorVisibilityCommand(
+        this.showSupervisor,
+        supervisorCommand,
+      );
+      const hasHistory =
+        Boolean(this.latestSupervisorDecision) ||
+        this.service
+          .store
+          .listTurnOutputs(this.run.id)
+          .some((entry) => entry.threadRole === "supervisor");
+      this.pushLog(
+        formatSupervisorVisibilityMessage(
+          this.showSupervisor,
+          hasHistory,
+          supervisorCommand,
+        ),
+      );
+      return;
+    }
+    if (trimmed.startsWith("/supervisor")) {
+      this.pushLog(SUPERVISOR_COMMAND_USAGE);
+      return;
+    }
+
+    const memoryCommand = parseSessionMemoryCommand(trimmed);
+    if (memoryCommand) {
+      if (memoryCommand.kind === "status") {
+        this.pushLog(await this.memory.status());
+        return;
+      }
+      if (memoryCommand.kind === "profile") {
+        this.pushLog(await this.memory.operatorProfile());
+        return;
+      }
+      if (memoryCommand.kind === "remember") {
+        const summary = await this.memory.rememberOperatorPreference(
+          memoryCommand.preference,
+          "manual",
+        );
+        this.pushLog(
+          summary || "No new operator preference captured (empty or duplicate).",
+        );
+        return;
+      }
+      this.pushLog(memoryCommand.hint);
+      return;
+    }
+
     switch (trimmed) {
       case "/new":
         this.pushLog("Use /exit to leave this run, then use /new in launcher.");
-        return;
-      case "/supervisor":
-        this.showSupervisor = !this.showSupervisor;
-        this.publish();
         return;
       case "/resume":
         this.pushLog(
@@ -630,9 +835,6 @@ class RunRuntime implements SessionController {
           this.publish();
         }
         await this.resumeAutonomy();
-        return;
-      case "/memory":
-        this.pushLog(await this.memory.status());
         return;
       case "/skills":
       case "/skills reload":
@@ -1987,6 +2189,26 @@ class RunRuntime implements SessionController {
   }
 
   private async sendOperatorMessage(message: string): Promise<void> {
+    try {
+      const captured =
+        await this.memory.captureOperatorPreferencesFromMessage(
+          message,
+          `operator-message/${this.run.id}`,
+        );
+      if (captured) {
+        await this.record("system", "memory-preference", {
+          message: captured,
+        });
+      }
+    } catch (error) {
+      await this.record("system", "memory-error", {
+        message:
+          error instanceof Error
+            ? `Operator preference capture failed: ${error.message}`
+            : `Operator preference capture failed: ${String(error)}`,
+      });
+    }
+
     const activeTurnId = this.activeTurnIds.worker;
     if (activeTurnId && this.agent.workerThreadId) {
       await this.service.codex.steerTurn(

@@ -125,6 +125,16 @@ describe("slash command autocomplete", () => {
     });
   });
 
+  test("/supervisor accepts optional mode arguments", () => {
+    const commands = getSlashCommands(false);
+    expect(validateSlashCommandInput("/supervisor on", commands)).toEqual({
+      kind: "ok",
+    });
+    expect(validateSlashCommandInput("/memory remember keep output concise", commands)).toEqual({
+      kind: "ok",
+    });
+  });
+
   test("/feedback requires a message", () => {
     const commands = getSlashCommands(false);
     expect(validateSlashCommandInput("/feedback", commands)).toEqual({
